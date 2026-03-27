@@ -338,8 +338,28 @@ with col1:
     counts_file = st.file_uploader("Upload RNA Counts (CSV)", type=["csv"])
     metadata_file = st.file_uploader("Upload Metadata (CSV)", type=["csv"])
     
+    # --- NEW: Dynamic Covariate Selection ---
+    condition_col = "condition" # Fallbacks
+    batch_col = "None"
+    
+    if metadata_file is not None:
+        # Peek at the metadata columns without locking up memory
+        temp_meta = pd.read_csv(metadata_file, nrows=0) 
+        meta_cols = temp_meta.columns.tolist()
+        
+        # CRITICAL FIX: Rewind the file pointer back to the beginning!
+        metadata_file.seek(0)
+        
+        st.markdown("---")
+        st.subheader("2. Experimental Design")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            condition_col = st.selectbox("Primary Contrast (e.g., Tumor vs Normal)", meta_cols, index=meta_cols.index("condition") if "condition" in meta_cols else 0)
+        with col_b:
+            batch_col = st.selectbox("Batch Covariate (Optional)", ["None"] + meta_cols)
+            
     st.markdown("---")
-    st.subheader("2. Statistical Cutoffs")
+    st.subheader("3. Statistical Cutoffs")
     # --- The Engine Selector and Form ---
     with st.form("stats_form"):
         de_engine = st.selectbox("Differential Expression Engine", ["PyDESeq2", "EdgePy"])
@@ -370,20 +390,33 @@ with col2:
         metadata_df = pd.read_csv(metadata_file, index_col=0)
         
         with st.spinner(f"Calculating Differential Expression using {de_engine}..."):
+            # Determine the design formula strings based on user selection
+            if batch_col != "None" and batch_col != condition_col:
+                design_factors = [batch_col, condition_col]
+                edge_formula = f"~{batch_col} + {condition_col}"
+            else:
+                design_factors = condition_col
+                edge_formula = f"~{condition_col}"
+
+            # Auto-detect the contrast levels from the primary column
+            unique_levels = metadata_df[condition_col].dropna().unique()
+            level_1 = unique_levels[0]
+            level_2 = unique_levels[1] if len(unique_levels) > 1 else unique_levels[0]
+
             if de_engine == "PyDESeq2":
-                # --- The original PyDESeq2 logic ---
-                dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors="condition")
+                # --- Updated PyDESeq2 logic with covariates ---
+                dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors=design_factors)
                 dds.deseq2()
-                stat_res = DeseqStats(dds, contrast=["condition", "Tumor", "Normal"])
+                stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2])
                 stat_res.summary()
                 results_df = stat_res.results_df
                 
             elif de_engine == "EdgePy":
-                # 1. Build the Design Matrix
-                design = dmatrix("~condition", data=metadata_df)
+                # 1. Build the Design Matrix with optional batch effect
+                design = dmatrix(edge_formula, data=metadata_df)
                 
-                # 2. Initialize the EdgePy DGEList (Digital Gene Expression)
-                dge_list = DGEList(counts=counts_df, samples=metadata_df, group_col="condition", genes=counts_df.index)
+                # 2. Initialize the EdgePy DGEList
+                dge_list = DGEList(counts=counts_df, samples=metadata_df, group_col=condition_col, genes=counts_df.index)
                 
                 # 3. Fit the Generalized Linear Model (GLM)
                 fit = glmFit(dge_list, design=design)
