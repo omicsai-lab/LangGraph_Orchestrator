@@ -90,6 +90,29 @@ class Plan(BaseModel):
 # ==========================================
 # 2. THE TOOLS (Python Functions)
 # ==========================================
+def get_gene_info(hugo_symbol):
+    """Fetches biological context, gene type, and aliases."""
+    url = f"https://mygene.info/v3/query?q=symbol:{hugo_symbol}&fields=name,summary,type_of_gene,alias&species=human"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("hits"):
+                hit = data["hits"][0]
+                # Format aliases nicely whether it's a string or a list
+                aliases = hit.get("alias", [])
+                if isinstance(aliases, list):
+                    aliases = ", ".join(aliases)
+                return {
+                    "name": hit.get("name", "Unknown"),
+                    "type": hit.get("type_of_gene", "Unknown"),
+                    "summary": hit.get("summary", "No summary available."),
+                    "aliases": aliases
+                }
+        return {"status": "Gene info not found."}
+    except Exception as e:
+        return {"status": f"API Error: {str(e)}"}
+
 def get_onco_data(hugo, alteration, tumor_type):
     url = "https://www.oncokb.org/api/v1/annotate/mutations/byProteinChange"
     params = {"hugoSymbol": hugo, "alteration": alteration, "tumorType": tumor_type}
@@ -254,7 +277,11 @@ def executor_node(state: AgentState):
         tumor_type = gene_info.get("tumor_type")
         source_tag = gene_info.get("source", "Unknown Source")
         
-        report = {"gene": hugo, "alteration": alt, "source": source_tag, "evidence": {}}
+        # NEW: Automatically fetch the biological definition first!
+        print(f"   -> Fetching biological context for {hugo}...")
+        gene_context = get_gene_info(hugo)
+        
+        report = {"gene": hugo, "alteration": alt, "source": source_tag, "biology": gene_context, "evidence": {}}
         
         if "oncokb" in plan_text:
             report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
@@ -282,10 +309,11 @@ def writer_node(state: AgentState):
     
     CRITICAL GUARDRAILS: 
     1. ONLY use the data in the Gathered Evidence. Do NOT invent drugs or trials.
-    2. For PubMed literature, read the Abstracts. Write a 1-2 sentence clinical summary of what the study actually found. Cite the PMID.
-    3. Make all ClinicalTrials NCT IDs clickable markdown links.
-    4. Important Context: Because this data originates from RNA sequencing (Overexpression), add a brief, single-sentence disclaimer at the top of the report stating: "*Note: Targeted therapies listed below typically require DNA confirmation of the specific mutation (e.g., V600E, L858R) associated with the overexpressed gene.*"
-    5. Lab Protocols: If 'Custom Lab Protocols' are provided in the context, you MUST incorporate those specific internal rules, dosing guidelines, or protocol notes into the report.
+    2. BIOLOGICAL TRIAGE: Look at the "biology" context for each gene. If the "type" is "pseudo", "pseudogene", or "ncRNA", immediately state that it is a non-coding artifact and unlikely to be a direct therapeutic target. 
+    3. For PubMed literature, read the Abstracts. Write a 1-2 sentence clinical summary of what the study actually found. Cite the PMID.
+    4. Make all ClinicalTrials NCT IDs clickable markdown links.
+    5. Important Context: Because this data originates from RNA sequencing (Overexpression), add a brief, single-sentence disclaimer at the top of the report stating: "*Note: Targeted therapies listed below typically require DNA confirmation of the specific mutation (e.g., V600E, L858R) associated with the overexpressed gene.*"
+    6. Lab Protocols: If 'Custom Lab Protocols' are provided in the context, you MUST incorporate those specific internal rules, dosing guidelines, or protocol notes into the report.
     
     REQUIRED REPORT STRUCTURE:
     You MUST format your report using this EXACT Markdown structure for EVERY gene sequentially. Do not omit the PMIDs:
@@ -371,14 +399,14 @@ with col1:
         de_engine = st.selectbox("Differential Expression Engine", ["PyDESeq2", "EdgePy"])
         pval_thresh = st.number_input("P-Value Cutoff", min_value=0.0001, max_value=0.1000, value=0.0500, step=0.0100, format="%.4f")
         log2fc_thresh = st.slider("Log2FC Threshold (Absolute)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
-        top_n_genes = st.slider("Max Targets for AI Report", min_value=1, max_value=15, value=3)
         
         update_plot_btn = st.form_submit_button("📊 Generate Volcano Plot")
 
     st.markdown("---")
-    st.subheader("4. Clinical Context")
+    st.subheader("3. Clinical Context & AI Triage")
     cancer_type = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value="Melanoma")
     analysis_mode = st.radio("Analysis Mode", ["Clinical Triage (Known Targets)", "Biomarker Discovery (Novel Targets)"])
+    top_n_genes = st.slider("Max Targets for AI Report", min_value=1, max_value=15, value=3)
     
     # --- NEW RAG UI ---
     st.markdown("---")
@@ -447,19 +475,20 @@ with col2:
         ]
         plot_df['Significance'] = np.select(conditions, ['Upregulated', 'Downregulated'], default='Not Significant')
         
-        st.session_state.ai_targets = plot_df[plot_df['Significance'] == 'Upregulated'].sort_values(by='padj').head(top_n_genes).index.tolist()
-        plot_df.loc[st.session_state.ai_targets, 'Significance'] = 'AI Selected Target'
+        # Save all upregulated genes to memory for the Actionability Filter
+        st.session_state.upregulated_df = plot_df[plot_df['Significance'] == 'Upregulated'].sort_values(by='padj')
 
-        # We added render_mode='webgl' so 40,000+ genes won't crash the browser!
+        # Generate a clean map of the tumor
         fig = px.scatter(
             plot_df, x='log2FoldChange', y='-log10(padj)', color='Significance', 
             color_discrete_map={
-                'AI Selected Target': '#FFD700', 'Upregulated': '#EF553B', 
+                'Upregulated': '#EF553B', 
                 'Downregulated': '#636EFA', 'Not Significant': '#4A4A4A' 
             },
             hover_name=plot_df.index,
             render_mode='webgl' 
         )
+
         # --- NEW: Changed lines to white ---
         fig.add_hline(y=-np.log10(pval_thresh), line_dash="dash", line_color="white")
         fig.add_vline(x=log2fc_thresh, line_dash="dash", line_color="white")
@@ -483,9 +512,35 @@ with col2:
 # ==========================================
 # EXECUTE THE AI GRAPH
 # ==========================================
-if run_button and counts_file and metadata_file and len(st.session_state.ai_targets) > 0:
+# ==========================================
+# EXECUTE THE AI GRAPH
+# ==========================================
+if run_button and counts_file and metadata_file:
     st.markdown("---")
     st.subheader("🤖 AI Clinical Report")
+    
+    # --- NEW: THE ACTIONABILITY FILTER ---
+    ACTIONABLE_GENES = ["BRAF", "EGFR", "KRAS", "PIK3CA", "ERBB2", "ALK", "ROS1", "MET", "RET", "NTRK1", "NTRK2", "NTRK3", "BRCA1", "BRCA2", "KIT", "PDGFRA", "FGFR1", "FGFR2", "FGFR3", "IDH1", "IDH2", "CDK4", "CDK6", "PTEN", "MTOR", "CTNNB1", "TP53"]
+    
+    up_df = st.session_state.get("upregulated_df", pd.DataFrame())
+    if up_df.empty:
+        st.error("⚠️ No upregulated genes found. Please lower your P-Value or Log2FC thresholds in the Volcano Plot first.")
+        st.stop()
+        
+    if "Discovery" in analysis_mode:
+        # NOVEL: Filter OUT the famous genes
+        novel_df = up_df[~up_df.index.isin(ACTIONABLE_GENES)]
+        st.session_state.ai_targets = novel_df.head(top_n_genes).index.tolist()
+    else:
+        # CLINICAL: ONLY look at famous genes
+        clinical_df = up_df[up_df.index.isin(ACTIONABLE_GENES)]
+        st.session_state.ai_targets = clinical_df.head(top_n_genes).index.tolist()
+        
+    if not st.session_state.ai_targets:
+        st.warning(f"⚠️ No targets found for {analysis_mode} mode. Try adjusting your statistical cutoffs.")
+        st.stop()
+        
+    st.success(f"🎯 **Target Selection Complete:** {', '.join(st.session_state.ai_targets)}")
     
     # --- NEW: RAG PDF PROCESSING (BULLETPROOF VERSION) ---
     rag_context = ""
