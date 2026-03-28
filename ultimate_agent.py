@@ -444,6 +444,10 @@ with col1:
     counts_file = st.file_uploader("Upload RNA Counts (CSV)", type=["csv"])
     metadata_file = st.file_uploader("Upload Metadata (CSV)", type=["csv"])
     
+    st.markdown("---")
+    st.subheader("Optional: DNA Mutational Profile")
+    dna_file = st.file_uploader("Upload DNA Variants (CSV with 'Gene' and 'Alteration' columns)", type=["csv"])
+    
     # --- NEW: Dynamic Covariate Selection ---
     condition_col = "condition" # Fallbacks
     batch_col = "None"
@@ -635,19 +639,46 @@ if run_button and counts_file and metadata_file:
     
     with st.spinner("Orchestrating AI Agents (Fetching OncoKB & PubMed)..."):
         structured_genes = []
+        dna_gene_names = []
+        
+        # 1. Parse Optional DNA Mutations (Highest Priority for FDA Drugs)
+        if dna_file is not None:
+            try:
+                dna_df = pd.read_csv(dna_file)
+                if 'Gene' in dna_df.columns and 'Alteration' in dna_df.columns:
+                    for _, row in dna_df.iterrows():
+                        gene_name = str(row['Gene']).strip()
+                        dna_gene_names.append(gene_name)
+                        structured_genes.append({
+                            "hugo": gene_name,
+                            "alteration": str(row['Alteration']).strip(),
+                            "tumor_type": cancer_type,
+                            "source": "DNA Mutation (Level 1/2 Priority)"
+                        })
+                dna_file.seek(0)
+            except Exception as e:
+                st.warning(f"⚠️ Could not parse DNA file: {str(e)}")
+        
+        # 2. Add RNA Overexpression Targets
         for gene in st.session_state.ai_targets:
             structured_genes.append({
                 "hugo": gene,
                 "alteration": "Overexpression", 
                 "tumor_type": cancer_type,
-                "source": "Volcanic Selection"
+                "source": "RNA Volcanic Selection"
             })
             
-        # Adjust the prompt based on the user's selected mode
+        # 3. Smart Prompt Generation (Handling both DNA and RNA)
         if "Discovery" in analysis_mode:
-            prompt_text = f"Analyze the following overexpressed genes ({', '.join(st.session_state.ai_targets)}) in {cancer_type} as potential novel biomarkers or immunotherapeutic targets. Focus on experimental literature."
+            prompt_text = f"Analyze the following overexpressed genes ({', '.join(st.session_state.ai_targets)}) in {cancer_type} as potential novel biomarkers or immunotherapeutic targets."
+            if dna_gene_names:
+                prompt_text += f" Also contextualize the presence of these specific DNA mutations: {', '.join(dna_gene_names)}."
         else:
-            prompt_text = f"Find established targeted therapies for {cancer_type} patients with overexpression in {', '.join(st.session_state.ai_targets)}."
+            prompt_text = f"Find established targeted therapies for {cancer_type} patients."
+            if dna_gene_names:
+                prompt_text += f" CRITICAL: Prioritize finding OncoKB Level 1/2 FDA-approved therapies for the following DNA mutations: {', '.join(dna_gene_names)}."
+            if st.session_state.ai_targets:
+                prompt_text += f" Secondary: Evaluate the following overexpressed targets: {', '.join(st.session_state.ai_targets)}."
 
         initial_state = {
             "user_prompt": prompt_text,
