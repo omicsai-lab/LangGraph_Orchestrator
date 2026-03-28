@@ -80,9 +80,10 @@ class AgentState(TypedDict):
     significant_genes: List[Dict[str, Any]]
     plan: List[str]
     gathered_evidence: Annotated[List[Dict[str, Any]], operator.add]
+    pathway_data: Dict[str, Any] # <-- NEW: Holds the Enrichr KEGG pathways
     final_report: str
-    custom_knowledge: str # <-- NEW: Slot for the RAG data
-    analysis_mode: str # <-- NEW: Clinical Triage vs. Biomarker Discovery
+    custom_knowledge: str 
+    analysis_mode: str
 
 class Plan(BaseModel):
     steps: List[str] = Field(description="Step-by-step plan of tools to execute.")
@@ -113,6 +114,42 @@ def get_gene_info(hugo_symbol):
     except Exception as e:
         return {"status": f"API Error: {str(e)}"}
 
+def get_enriched_pathways(gene_list):
+    """Uses the Enrichr API to find overlapping biological pathways for a list of genes."""
+    if not gene_list:
+        return "No genes provided for pathway analysis."
+        
+    enrichr_add_url = 'https://maayanlab.cloud/Enrichr/addList'
+    payload = {
+        'list': (None, '\n'.join(gene_list)),
+        'description': (None, 'OncoApp_Gene_List')
+    }
+    
+    try:
+        # 1. Upload the list to Enrichr
+        res_add = requests.post(enrichr_add_url, files=payload)
+        if not res_add.ok: return "Enrichr API upload failed."
+        user_list_id = res_add.json().get('userListId')
+        
+        # 2. Query the KEGG Pathway Database
+        enrichr_query_url = f'https://maayanlab.cloud/Enrichr/enrich?userListId={user_list_id}&backgroundType=KEGG_2021_Human'
+        res_query = requests.get(enrichr_query_url)
+        if not res_query.ok: return "Enrichr KEGG query failed."
+        
+        results = res_query.json().get('KEGG_2021_Human', [])
+        
+        # 3. Extract the top 3 most significant pathways
+        top_pathways = []
+        for r in results[:3]:
+            top_pathways.append({
+                "pathway": r[1],
+                "p_value": r[2],
+                "overlapping_genes": r[5]
+            })
+        return {"status": "Success", "pathways": top_pathways}
+    except Exception as e:
+        return {"status": f"Enrichr Request failed: {str(e)}"}
+
 def get_onco_data(hugo, alteration, tumor_type):
     url = "https://www.oncokb.org/api/v1/annotate/mutations/byProteinChange"
     params = {"hugoSymbol": hugo, "alteration": alteration, "tumorType": tumor_type}
@@ -138,11 +175,19 @@ def get_onco_data(hugo, alteration, tumor_type):
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
 
-def search_pubmed(gene, tumor_type, mode="Clinical Triage"):
+def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases=""):
+    # Clean up the aliases into a search string if they exist
+    alias_query = ""
+    if aliases and aliases != "Unknown":
+        # Take up to the first 2 aliases to prevent massive URL queries
+        alias_list = [a.strip() for a in aliases.split(',')][:2]
+        if alias_list:
+            alias_query = " OR " + " OR ".join([f"{a}[Title/Abstract]" for a in alias_list])
+
     if "Discovery" in mode:
-        search_query = f"{gene}[Gene] AND {tumor_type} AND (immunotherapy OR biomarker OR novel target)"
+        search_query = f"({gene}[Gene]{alias_query}) AND {tumor_type} AND (immunotherapy OR biomarker OR novel target)"
     else:
-        search_query = f"{gene}[Gene] AND {tumor_type} AND targeted therapy"
+        search_query = f"({gene}[Gene]{alias_query}) AND {tumor_type} AND targeted therapy"
         
     search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     search_params = {"db": "pubmed", "term": search_query, "retmode": "json", "retmax": 3}
@@ -271,6 +316,11 @@ def executor_node(state: AgentState):
     genes = state.get("significant_genes", [])
     new_evidence = []
     
+    # NEW: Run Pathway Analysis for the entire group of targets
+    print("   -> Running KEGG Pathway Analysis via Enrichr...")
+    gene_symbols = [g.get("hugo") for g in genes]
+    pathway_results = get_enriched_pathways(gene_symbols)
+    
     for gene_info in genes:
         hugo = gene_info.get("hugo")
         alt = gene_info.get("alteration")
@@ -286,55 +336,77 @@ def executor_node(state: AgentState):
         if "oncokb" in plan_text:
             report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
         if "pubmed" in plan_text:
-            # Pass the mode into the PubMed search
-            report["evidence"]["PubMed"] = search_pubmed(hugo, tumor_type, mode=state.get("analysis_mode", "Clinical Triage"))
+            # Pass the mode AND the aliases into the PubMed search
+            report["evidence"]["PubMed"] = search_pubmed(
+                hugo, 
+                tumor_type, 
+                mode=state.get("analysis_mode", "Clinical Triage"),
+                aliases=gene_context.get("aliases", "")
+            )
         if "clinicaltrials" in plan_text or "trials" in plan_text:
             print(f"   -> Fetching Clinical Trials for {hugo}...")
             report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
             
         new_evidence.append(report)
         
-    return {"gathered_evidence": new_evidence}
+    return {"gathered_evidence": new_evidence, "pathway_data": pathway_results}
 
 def writer_node(state: AgentState):
     print("✍️ [NODE: Writer] Synthesizing the final clinical report...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
     
-    sys_msg = """You are an expert Clinical Oncology Medical Writer.
-    Write a beautiful, multi-paragraph scientific report answering the user's prompt.
+    analysis_mode = state.get("analysis_mode", "Clinical Triage")
     
-    CRITICAL CLINICAL TRIAGE RULES:
-    1. Standard of Care (On-Label): List only drugs with Level 1 or Level 2 evidence. These are FDA-approved for the user's specific cancer type.
-    2. Repurposing Opportunities (Off-Label): List only drugs with Level 3 (3A, 3B) or Level 4 evidence. These are approved for different cancers but show biomarker matches.
+    if "Discovery" in analysis_mode:
+        sys_msg = """You are an expert Systems Biologist and Bioinformatics AI.
+        Write a beautiful, pathway-centric scientific report answering the user's prompt. 
+        
+        CRITICAL GUARDRAILS:
+        1. TONE AND STYLE: NEVER break the fourth wall. Do NOT say "per your guardrails", "in the provided evidence", or "your PubMed pull". Write confidently as if you are authoring a published review article in a high-impact oncology journal.
+        2. BIOLOGICAL TRIAGE: Explicitly dismiss pseudogenes and ncRNAs as non-coding artifacts.
+        3. ACRONYM COLLISIONS: Be highly aware of literature false-positives. If PubMed returns papers where the gene symbol is used as an acronym for a drug (e.g., CEL = Celastrol) or a biological process (e.g., LPO = Lipid Peroxidation), YOU MUST EXPLICITLY CALL THIS OUT as a literature mismatch. Do not treat the paper as evidence for the gene.
+        4. SYSTEMS APPROACH: Do NOT list genes one by one. Group them by their pathway and discuss them as a network.
+        
+        REQUIRED REPORT STRUCTURE:
+        ## 🕸️ Systems Biology & Pathway Dysregulation
+        [Write a multi-paragraph synthesis of the KEGG pathway data. How do these networks (and their overlapping genes) interact to drive the tumor microenvironment, metabolic reprogramming, or immune evasion?]
+        
+        ## 🔬 Targetable Hubs & Experimental Literature
+        [Synthesize the PubMed literature conceptually. Discuss the valid genes as a group. If papers suffered from Acronym Collisions, note that the literature is currently lacking for the specific genes due to nomenclature overlap.]
+        
+        ## 🏥 Translational Outlook
+        [Summarize any relevant trials, or state that these novel network targets currently lack specific recruiting trials.]
+        """
+    else:
+        sys_msg = """You are an expert Clinical Oncology Medical Writer.
+        Write a beautiful, multi-paragraph scientific report answering the user's prompt.
+        
+        CRITICAL CLINICAL TRIAGE RULES:
+        1. Standard of Care: Level 1 or 2 evidence.
+        2. Repurposing: Level 3 or 4 evidence.
+        3. Dismiss pseudogenes/ncRNAs using the biology context.
+        
+        REQUIRED REPORT STRUCTURE:
+        First, provide a brief summary of the overarching biological pathways driving this tumor:
+        ### 🕸️ Pathway & Network Dysregulation
+        - [Write a 2-3 sentence summary based on the KEGG pathway_data provided. Mention the overlapping genes.]
+        
+        Then, for EVERY gene sequentially, use this exact structure:
+        ## [Gene Name] ([Alteration])
+        
+        ### 💊 OncoKB Therapeutics
+        - **Standard of Care (On-Label):** [Drug Name] (PMIDs: [List])
+        - **Repurposing Opportunities (Off-Label):** [Drug Name] (PMIDs: [List])
+        
+        ### 🔬 Experimental Literature
+        - **[Study Topic]:** [Summary] (PMID: [Number])
+        
+        ### 🏥 Actively Recruiting Trials
+        - **[[NCT ID]](https://clinicaltrials.gov/study/[NCT ID]):** [Phase] - [Trial Title]
+        
+        Do not deviate from this structure."""
     
-    CRITICAL GUARDRAILS: 
-    1. ONLY use the data in the Gathered Evidence. Do NOT invent drugs or trials.
-    2. BIOLOGICAL TRIAGE: Look at the "biology" context for each gene. If the "type" is "pseudo", "pseudogene", or "ncRNA", immediately state that it is a non-coding artifact and unlikely to be a direct therapeutic target. 
-    3. For PubMed literature, read the Abstracts. Write a 1-2 sentence clinical summary of what the study actually found. Cite the PMID.
-    4. Make all ClinicalTrials NCT IDs clickable markdown links.
-    5. Important Context: Because this data originates from RNA sequencing (Overexpression), add a brief, single-sentence disclaimer at the top of the report stating: "*Note: Targeted therapies listed below typically require DNA confirmation of the specific mutation (e.g., V600E, L858R) associated with the overexpressed gene.*"
-    6. Lab Protocols: If 'Custom Lab Protocols' are provided in the context, you MUST incorporate those specific internal rules, dosing guidelines, or protocol notes into the report.
-    
-    REQUIRED REPORT STRUCTURE:
-    You MUST format your report using this EXACT Markdown structure for EVERY gene sequentially. Do not omit the PMIDs:
-    
-    ## [Gene Name] ([Alteration])
-    
-    ### 💊 OncoKB Therapeutics
-    - **Standard of Care (On-Label):**
-      - [Drug Name]: [Clinical Context] (PMIDs: [List PMIDs])
-    - **Repurposing Opportunities (Off-Label):**
-      - [Drug Name]: [Clinical Context] (PMIDs: [List PMIDs])
-    
-    ### 🔬 Experimental Literature
-    - **[Study Topic/Focus]:** [1-2 sentence summary of abstract] (PMID: [Number])
-    
-    ### 🏥 Actively Recruiting Trials
-    - **[[NCT ID]](https://clinicaltrials.gov/study/[NCT ID]):** [Phase] - [Trial Title]
-    
-    Do not deviate from this structure."""
-    
-    user_context = f"User Prompt: {state.get('user_prompt')}\nGathered Evidence: {json.dumps(state.get('gathered_evidence'))}\nCustom Lab Protocols: {state.get('custom_knowledge', 'None provided.')}"
+    user_context = f"User Prompt: {state.get('user_prompt')}\nPathway Data: {json.dumps(state.get('pathway_data', {}))}\nGathered Evidence: {json.dumps(state.get('gathered_evidence'))}\nCustom Lab Protocols: {state.get('custom_knowledge', 'None provided.')}"
     
     response = llm.invoke([
         SystemMessage(content=sys_msg),
@@ -582,6 +654,7 @@ if run_button and counts_file and metadata_file:
             "significant_genes": structured_genes,
             "plan": [],
             "gathered_evidence": [],
+            "pathway_data": {},
             "final_report": "",
             "custom_knowledge": rag_context, # <-- NEW: Pass the PDF text to the AI!
             "analysis_mode": analysis_mode
@@ -592,6 +665,7 @@ if run_button and counts_file and metadata_file:
         st.session_state.run_complete = True
         st.session_state.final_report = final_state["final_report"]
         st.session_state.plan = final_state["plan"]
+        st.session_state.pathway_data = final_state.get("pathway_data", {}) # <-- NEW: Extract pathway data
         
 # ==========================================
 # 5. RENDER RESULTS & CHATBOT (From Memory)
@@ -605,6 +679,41 @@ if st.session_state.run_complete:
         for step in st.session_state.plan:
             st.write(f"- {step}")
             
+    # --- NEW: PATHWAY VISUALIZATION ---
+    pathway_info = st.session_state.get("pathway_data", {})
+    if isinstance(pathway_info, dict) and pathway_info.get("status") == "Success":
+        st.markdown("### 🕸️ Enriched Biological Pathways (KEGG)")
+        pathways = pathway_info.get("pathways", [])
+        
+        if pathways:
+            # Convert to DataFrame for Plotly
+            pw_df = pd.DataFrame(pathways)
+            # -log10 transform the p-value for better visualization
+            pw_df['Significance Score (-log10 p-value)'] = -np.log10(pw_df['p_value'] + 1e-10)
+            
+            # Draw horizontal bar chart
+            # Draw horizontal bar chart
+            pw_fig = px.bar(
+                pw_df, 
+                x='Significance Score (-log10 p-value)', 
+                y='pathway', 
+                orientation='h',
+                title="Top Associated KEGG Pathways",
+                text='overlapping_genes',
+                color='Significance Score (-log10 p-value)',
+                color_continuous_scale='Sunsetdark' # A warmer, less clunky dark mode palette
+            )
+            # Clean up the layout, text position, and hover decimals
+            pw_fig.update_layout(yaxis={'categoryorder':'total ascending'}, height=300, margin=dict(l=20, r=20, t=40, b=20))
+            pw_fig.update_traces(
+                textposition='inside', 
+                textfont=dict(color='white'),
+                hovertemplate="<b>%{y}</b><br>Score: %{x:.2f}<br>Genes: %{text}<extra></extra>"
+            )
+            st.plotly_chart(pw_fig, use_container_width=True)
+        else:
+            st.info("No statistically significant pathways found for these targets.")
+
     st.markdown("### 📄 Final Synthesized Clinical Report")
     st.info("This report was autonomously written by the Medical Writer LLM based solely on validated tool data.")
     st.markdown(st.session_state.final_report)
