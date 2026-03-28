@@ -82,6 +82,7 @@ class AgentState(TypedDict):
     gathered_evidence: Annotated[List[Dict[str, Any]], operator.add]
     final_report: str
     custom_knowledge: str # <-- NEW: Slot for the RAG data
+    analysis_mode: str # <-- NEW: Clinical Triage vs. Biomarker Discovery
 
 class Plan(BaseModel):
     steps: List[str] = Field(description="Step-by-step plan of tools to execute.")
@@ -114,8 +115,12 @@ def get_onco_data(hugo, alteration, tumor_type):
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
 
-def search_pubmed(gene, tumor_type):
-    search_query = f"{gene}[Gene] AND {tumor_type} AND targeted therapy"
+def search_pubmed(gene, tumor_type, mode="Clinical Triage"):
+    if "Discovery" in mode:
+        search_query = f"{gene}[Gene] AND {tumor_type} AND (immunotherapy OR biomarker OR novel target)"
+    else:
+        search_query = f"{gene}[Gene] AND {tumor_type} AND targeted therapy"
+        
     search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     search_params = {"db": "pubmed", "term": search_query, "retmode": "json", "retmax": 3}
     
@@ -254,7 +259,8 @@ def executor_node(state: AgentState):
         if "oncokb" in plan_text:
             report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
         if "pubmed" in plan_text:
-            report["evidence"]["PubMed"] = search_pubmed(hugo, tumor_type)
+            # Pass the mode into the PubMed search
+            report["evidence"]["PubMed"] = search_pubmed(hugo, tumor_type, mode=state.get("analysis_mode", "Clinical Triage"))
         if "clinicaltrials" in plan_text or "trials" in plan_text:
             print(f"   -> Fetching Clinical Trials for {hugo}...")
             report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
@@ -370,12 +376,13 @@ with col1:
         update_plot_btn = st.form_submit_button("📊 Generate Volcano Plot")
 
     st.markdown("---")
-    st.subheader("3. Clinical Context")
+    st.subheader("4. Clinical Context")
     cancer_type = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value="Melanoma")
+    analysis_mode = st.radio("Analysis Mode", ["Clinical Triage (Known Targets)", "Biomarker Discovery (Novel Targets)"])
     
     # --- NEW RAG UI ---
     st.markdown("---")
-    st.subheader("4. Custom Knowledge (Optional)")
+    st.subheader("5. Custom Knowledge (Optional)")
     uploaded_pdf = st.file_uploader("Upload Lab Protocols/Guidelines (PDF)", type=["pdf"])
     
     st.markdown("---")
@@ -443,13 +450,15 @@ with col2:
         st.session_state.ai_targets = plot_df[plot_df['Significance'] == 'Upregulated'].sort_values(by='padj').head(top_n_genes).index.tolist()
         plot_df.loc[st.session_state.ai_targets, 'Significance'] = 'AI Selected Target'
 
+        # We added render_mode='webgl' so 40,000+ genes won't crash the browser!
         fig = px.scatter(
             plot_df, x='log2FoldChange', y='-log10(padj)', color='Significance', 
             color_discrete_map={
                 'AI Selected Target': '#FFD700', 'Upregulated': '#EF553B', 
-                'Downregulated': '#636EFA', 'Not Significant': '#4A4A4A' # NEW: Dark grey for better contrast
+                'Downregulated': '#636EFA', 'Not Significant': '#4A4A4A' 
             },
-            hover_name=plot_df.index
+            hover_name=plot_df.index,
+            render_mode='webgl' 
         )
         # --- NEW: Changed lines to white ---
         fig.add_hline(y=-np.log10(pval_thresh), line_dash="dash", line_color="white")
@@ -507,13 +516,20 @@ if run_button and counts_file and metadata_file and len(st.session_state.ai_targ
                 "source": "Volcanic Selection"
             })
             
+        # Adjust the prompt based on the user's selected mode
+        if "Discovery" in analysis_mode:
+            prompt_text = f"Analyze the following overexpressed genes ({', '.join(st.session_state.ai_targets)}) in {cancer_type} as potential novel biomarkers or immunotherapeutic targets. Focus on experimental literature."
+        else:
+            prompt_text = f"Find established targeted therapies for {cancer_type} patients with overexpression in {', '.join(st.session_state.ai_targets)}."
+
         initial_state = {
-            "user_prompt": f"Find targeted therapies for {cancer_type} patients with overexpression in {', '.join(st.session_state.ai_targets)}",
+            "user_prompt": prompt_text,
             "significant_genes": structured_genes,
             "plan": [],
             "gathered_evidence": [],
             "final_report": "",
-            "custom_knowledge": rag_context # <-- NEW: Pass the PDF text to the AI!
+            "custom_knowledge": rag_context, # <-- NEW: Pass the PDF text to the AI!
+            "analysis_mode": analysis_mode
         }
         
         final_state = orchestrator.invoke(initial_state)
