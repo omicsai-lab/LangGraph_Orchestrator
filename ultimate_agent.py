@@ -6,6 +6,7 @@ import requests
 import json
 import operator
 import time
+import copy # <-- NEW: Needed for HITL evidence editing
 import xml.etree.ElementTree as ET
 import markdown
 from io import BytesIO
@@ -71,6 +72,10 @@ if "run_complete" not in st.session_state:
     st.session_state.run_complete = False
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "gathering_complete" not in st.session_state:
+    st.session_state.gathering_complete = False
+if "agent_state" not in st.session_state:
+    st.session_state.agent_state = {}
 
 # ==========================================
 # 1. GRAPH STATE & SCHEMAS
@@ -80,17 +85,26 @@ class AgentState(TypedDict):
     significant_genes: List[Dict[str, Any]]
     plan: List[str]
     gathered_evidence: Annotated[List[Dict[str, Any]], operator.add]
-    pathway_data: Dict[str, Any] # <-- NEW: Holds the Enrichr KEGG pathways
+    pathway_data: Dict[str, Any] 
     final_report: str
     custom_knowledge: str 
     analysis_mode: str
+    discarded_evidence: List[Dict[str, Any]] 
+    ai_filtered_evidence: List[Dict[str, Any]]
+    expert_consensus: str # <-- NEW: Holds the multi-agent debate
 
 class Plan(BaseModel):
     steps: List[str] = Field(description="Step-by-step plan of tools to execute.")
 
+# --- NEW: AI SCORER SCHEMA ---
+class PaperScore(BaseModel):
+    score: int = Field(description="Relevance score from 1 to 10")
+    reason: str = Field(description="Short 3-15 word reason (e.g., 'Acronym Collision', 'Strong evidence', 'Wrong Disease')")
+
 # ==========================================
 # 2. THE TOOLS (Python Functions)
 # ==========================================
+@st.cache_data(ttl="1d", show_spinner=False)
 def get_gene_info(hugo_symbol):
     """Fetches biological context, gene type, and aliases."""
     url = f"https://mygene.info/v3/query?q=symbol:{hugo_symbol}&fields=name,summary,type_of_gene,alias&species=human"
@@ -114,6 +128,7 @@ def get_gene_info(hugo_symbol):
     except Exception as e:
         return {"status": f"API Error: {str(e)}"}
 
+@st.cache_data(ttl="1d", show_spinner=False)
 def get_enriched_pathways(gene_list):
     """Uses the Enrichr API to find overlapping biological pathways for a list of genes."""
     if not gene_list:
@@ -150,6 +165,7 @@ def get_enriched_pathways(gene_list):
     except Exception as e:
         return {"status": f"Enrichr Request failed: {str(e)}"}
 
+@st.cache_data(ttl="1d", show_spinner=False)
 def get_onco_data(hugo, alteration, tumor_type):
     url = "https://www.oncokb.org/api/v1/annotate/mutations/byProteinChange"
     params = {"hugoSymbol": hugo, "alteration": alteration, "tumorType": tumor_type}
@@ -175,6 +191,7 @@ def get_onco_data(hugo, alteration, tumor_type):
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
 
+@st.cache_data(ttl="1d", show_spinner=False)
 def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases=""):
     # Clean up the aliases into a search string if they exist
     alias_query = ""
@@ -184,13 +201,15 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases=""):
         if alias_list:
             alias_query = " OR " + " OR ".join([f"{a}[Title/Abstract]" for a in alias_list])
 
+    # NEW: Using [TIAB] forces PubMed to only look in the Title/Abstract, drastically reducing noise!
     if "Discovery" in mode:
-        search_query = f"({gene}[Gene]{alias_query}) AND {tumor_type} AND (immunotherapy OR biomarker OR novel target)"
+        search_query = f"({gene}[TIAB]{alias_query}) AND {tumor_type}[TIAB] AND (immunotherapy OR biomarker OR target)"
     else:
-        search_query = f"({gene}[Gene]{alias_query}) AND {tumor_type} AND targeted therapy"
+        search_query = f"({gene}[TIAB]{alias_query}) AND {tumor_type}[TIAB] AND targeted therapy"
         
     search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-    search_params = {"db": "pubmed", "term": search_query, "retmode": "json", "retmax": 3}
+    # NEW: Fetch up to 10 candidates so the AI has plenty to choose from
+    search_params = {"db": "pubmed", "term": search_query, "retmode": "json", "retmax": 10}
     
     try:
         res = requests.get(search_url, params=search_params)
@@ -235,6 +254,7 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases=""):
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
 
+@st.cache_data(ttl="1d", show_spinner=False)
 def search_clinical_trials(gene, tumor_type):
     url = "https://clinicaltrials.gov/api/v2/studies"
     query = f"{gene} AND {tumor_type}"
@@ -264,6 +284,32 @@ def search_clinical_trials(gene, tumor_type):
             return {"status": "Success", "trials": trials}
             
         return {"status": f"ClinicalTrials Error: {res.status_code}"}
+    except Exception as e:
+        return {"status": f"Request failed: {str(e)}"}
+
+@st.cache_data(ttl="1d", show_spinner=False)
+def get_protein_interactions(hugo_symbol):
+    """Fetches top 3 interacting proteins from STRING DB (Guilt by Association)."""
+    # 9606 is the NCBI taxonomy ID for Homo sapiens
+    url = f"https://string-db.org/api/json/network?identifiers={hugo_symbol}&species=9606&limit=3"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            data = res.json()
+            if not data:
+                return {"status": "No interactions found."}
+            
+            interactors = []
+            for edge in data:
+                # Get the protein that is NOT our query gene
+                neighbor = edge.get("preferredName_B") if edge.get("preferredName_A") == hugo_symbol else edge.get("preferredName_A")
+                if neighbor and neighbor not in interactors:
+                    interactors.append(neighbor)
+            
+            # Keep only the top 3 unique neighbors
+            interactors = interactors[:3]
+            return {"status": "Success", "interacting_proteins": interactors}
+        return {"status": f"STRING API Error: {res.status_code}"}
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
 
@@ -335,21 +381,101 @@ def executor_node(state: AgentState):
         
         if "oncokb" in plan_text:
             report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
+            
         if "pubmed" in plan_text:
-            # Pass the mode AND the aliases into the PubMed search
-            report["evidence"]["PubMed"] = search_pubmed(
+            pubmed_data = search_pubmed(
                 hugo, 
                 tumor_type, 
                 mode=state.get("analysis_mode", "Clinical Triage"),
                 aliases=gene_context.get("aliases", "")
             )
+            
+            # --- AI RELEVANCE SCORER (OVERSAMPLE & FILTER) ---
+            if pubmed_data.get("status") == "Success" and pubmed_data.get("papers"):
+                print(f"   -> Grading literature relevance for {hugo}...")
+                grader_llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key).with_structured_output(PaperScore)
+                
+                candidate_papers = pubmed_data["papers"]
+                good_papers = []
+                
+                bio_name = gene_context.get('name', 'Unknown')
+                bio_summary = gene_context.get('summary', 'No summary available.')
+                
+                for p in candidate_papers:
+                    if len(good_papers) >= 3:
+                        break # We found 3 good papers! Stop grading to save OpenAI tokens.
+                        
+                    eval_prompt = f"""
+                    Evaluate this abstract's relevance to the gene {hugo} ({bio_name}) in {tumor_type}.
+                    Biological Function of {hugo}: {bio_summary}
+                    
+                    CRITICAL RUBRIC:
+                    - Score 1-4: Acronym collision (e.g., {hugo} refers to a drug/procedure), completely unrelated disease, or animal model without clinical relevance.
+                    - Score 5-10: Relevant. The gene is mentioned in a functional, prognostic, or therapeutic context.
+                    
+                    Title: {p['Title']}
+                    Abstract: {p['Abstract'][:800]}
+                    """
+                    
+                    try:
+                        score_result = grader_llm.invoke([
+                            SystemMessage(content="You are an expert oncology peer-reviewer. Output strict JSON grading the paper's relevance."),
+                            HumanMessage(content=eval_prompt)
+                        ])
+                        p["AI_Score"] = score_result.score
+                        p["AI_Reason"] = score_result.reason
+                        
+                        if score_result.score >= 5:
+                            good_papers.append(p)
+                        else:
+                            # Toss it into the AI's trash can!
+                            ai_filtered_evidence = state.get("ai_filtered_evidence", [])
+                            ai_filtered_evidence.append({
+                                "Gene": hugo,
+                                "Score": score_result.score,
+                                "Reason": score_result.reason,
+                                "Title": p["Title"],
+                                "PMID": p["PMID"]
+                            })
+                            state["ai_filtered_evidence"] = ai_filtered_evidence
+                            
+                    except Exception as e:
+                        print(f"Scoring failed for {hugo}: {e}")
+                        p["AI_Score"] = "?"
+                        p["AI_Reason"] = "Error"
+                        good_papers.append(p) # Keep it if scoring fails just to be safe
+                
+                # Replace the massive list of 10 papers with ONLY the good ones
+                pubmed_data["papers"] = good_papers
+                        
+            report["evidence"]["PubMed"] = pubmed_data
+            
+        if "Discovery" in state.get("analysis_mode", "Clinical Triage"):
+            print(f"   -> Fetching STRING protein network for {hugo}...")
+            report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
+
         if "clinicaltrials" in plan_text or "trials" in plan_text:
             print(f"   -> Fetching Clinical Trials for {hugo}...")
             report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
             
         new_evidence.append(report)
         
-    return {"gathered_evidence": new_evidence, "pathway_data": pathway_results}
+    return {"gathered_evidence": new_evidence, "pathway_data": pathway_results, "ai_filtered_evidence": state.get("ai_filtered_evidence", [])}
+
+def clinical_review_node(state: AgentState):
+    print("🧑‍⚕️ [NODE: Clinical Review] Pathologist and Oncologist are debating...")
+    llm = ChatOpenAI(model="gpt-5.2", temperature=0.3, api_key=openai_key)
+    
+    prompt = f"""
+    You are hosting a clinical tumor board. Review this preliminary data for {state.get('user_prompt')}.
+    Clean Evidence: {json.dumps(state.get('gathered_evidence'))}
+    Pathways: {json.dumps(state.get('pathway_data'))}
+    
+    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context, tumor microenvironment, and biological plausibility of these targets.
+    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability, clinical trial viability, and translational challenges of these targets.
+    """
+    response = llm.invoke([HumanMessage(content=prompt)])
+    return {"expert_consensus": response.content}
 
 def writer_node(state: AgentState):
     print("✍️ [NODE: Writer] Synthesizing the final clinical report...")
@@ -366,6 +492,7 @@ def writer_node(state: AgentState):
         2. BIOLOGICAL TRIAGE: Explicitly dismiss pseudogenes and ncRNAs as non-coding artifacts.
         3. ACRONYM COLLISIONS: Be highly aware of literature false-positives. If PubMed returns papers where the gene symbol is used as an acronym for a drug (e.g., CEL = Celastrol) or a biological process (e.g., LPO = Lipid Peroxidation), YOU MUST EXPLICITLY CALL THIS OUT as a literature mismatch. Do not treat the paper as evidence for the gene.
         4. SYSTEMS APPROACH: Do NOT list genes one by one. Group them by their pathway and discuss them as a network.
+        5. GUILT BY ASSOCIATION: If a target lacks direct literature or trials, look at its "STRING_Interactions" data. Discuss whether targeting its direct protein neighbors might offer a backdoor therapeutic strategy.
         
         REQUIRED REPORT STRUCTURE:
         ## 🕸️ Systems Biology & Pathway Dysregulation
@@ -375,7 +502,10 @@ def writer_node(state: AgentState):
         [Synthesize the PubMed literature conceptually. Discuss the valid genes as a group. If papers suffered from Acronym Collisions, note that the literature is currently lacking for the specific genes due to nomenclature overlap.]
         
         ## 🏥 Translational Outlook
-        [Summarize any relevant trials, or state that these novel network targets currently lack specific recruiting trials.]
+        [Summarize any relevant trials, or state that these novel network targets currently lack specific recruiting trials. Explicitly comment on WHY this biological connection is novel and HOW it is biologically plausible based on the Pathologist/Oncologist consensus.]
+        
+        ### 🧪 Recommended Next Experimental Steps
+        [Provide 3-4 bullet points on how a wet-lab researcher should experimentally validate these findings to de-risk them for clinical translation.]
         """
     else:
         sys_msg = """You are an expert Clinical Oncology Medical Writer.
@@ -406,7 +536,7 @@ def writer_node(state: AgentState):
         
         Do not deviate from this structure."""
     
-    user_context = f"User Prompt: {state.get('user_prompt')}\nPathway Data: {json.dumps(state.get('pathway_data', {}))}\nGathered Evidence: {json.dumps(state.get('gathered_evidence'))}\nCustom Lab Protocols: {state.get('custom_knowledge', 'None provided.')}"
+    user_context = f"User Prompt: {state.get('user_prompt')}\nPathway Data: {json.dumps(state.get('pathway_data', {}))}\nExpert Consensus: {state.get('expert_consensus')}\nGathered Evidence: {json.dumps(state.get('gathered_evidence'))}\nCustom Lab Protocols: {state.get('custom_knowledge', 'None provided.')}"
     
     response = llm.invoke([
         SystemMessage(content=sys_msg),
@@ -419,13 +549,13 @@ def writer_node(state: AgentState):
 workflow = StateGraph(AgentState)
 workflow.add_node("planner", planner_node)
 workflow.add_node("executor", executor_node)
+workflow.add_node("clinical_review", clinical_review_node) # <-- NEW
 workflow.add_node("writer", writer_node)
 
 workflow.add_edge(START, "planner")
 workflow.add_edge("planner", "executor")
-workflow.add_edge("executor", "writer")
-workflow.add_edge("writer", END)
-
+# We remove the direct edge from executor to writer, because Streamlit HITL handles the pause!
+# The graph just holds the nodes. We call them manually in Streamlit.
 orchestrator = workflow.compile()
 
 # ==========================================
@@ -484,13 +614,21 @@ with col1:
     analysis_mode = st.radio("Analysis Mode", ["Clinical Triage (Known Targets)", "Biomarker Discovery (Novel Targets)"])
     top_n_genes = st.slider("Max Targets for AI Report", min_value=1, max_value=15, value=3)
     
+    st.markdown("### 🧑‍⚕️ Clinical Safety & Evidence")
+    hitl_toggle = st.toggle("⏸️ Enable Human-in-the-Loop (Review evidence before report generation)", value=True)
+    
+    # NEW: Dynamic button text!
+    if hitl_toggle:
+        btn_text = "⏸️ Step 1: Gather Evidence for Review"
+    else:
+        btn_text = "🚀 Run Full AI Clinical Triage"
+        
+    run_button = st.button(btn_text, use_container_width=True, type="primary")
+    
     # --- NEW RAG UI ---
     st.markdown("---")
     st.subheader("5. Custom Knowledge (Optional)")
     uploaded_pdf = st.file_uploader("Upload Lab Protocols/Guidelines (PDF)", type=["pdf"])
-    
-    st.markdown("---")
-    run_button = st.button("🚀 Run AI Clinical Triage", use_container_width=True, type="primary")
 
 with col2:
     st.subheader("Interactive Volcano Plot")
@@ -645,19 +783,25 @@ if run_button and counts_file and metadata_file:
         if dna_file is not None:
             try:
                 dna_df = pd.read_csv(dna_file)
-                if 'Gene' in dna_df.columns and 'Alteration' in dna_df.columns:
-                    for _, row in dna_df.iterrows():
-                        gene_name = str(row['Gene']).strip()
-                        dna_gene_names.append(gene_name)
-                        structured_genes.append({
-                            "hugo": gene_name,
-                            "alteration": str(row['Alteration']).strip(),
-                            "tumor_type": cancer_type,
-                            "source": "DNA Mutation (Level 1/2 Priority)"
-                        })
+                
+                # NEW: Hard stop if the columns are wrong
+                if 'Gene' not in dna_df.columns or 'Alteration' not in dna_df.columns:
+                    st.error("🚨 CRITICAL ERROR: Your DNA CSV must contain exactly two columns named 'Gene' and 'Alteration'. Please fix your file and re-upload.")
+                    st.stop() # This instantly halts the app to protect clinical safety!
+                    
+                for _, row in dna_df.iterrows():
+                    gene_name = str(row['Gene']).strip()
+                    dna_gene_names.append(gene_name)
+                    structured_genes.append({
+                        "hugo": gene_name,
+                        "alteration": str(row['Alteration']).strip(),
+                        "tumor_type": cancer_type,
+                        "source": "DNA Mutation (Level 1/2 Priority)"
+                    })
                 dna_file.seek(0)
             except Exception as e:
-                st.warning(f"⚠️ Could not parse DNA file: {str(e)}")
+                st.error(f"🚨 CRITICAL ERROR: Could not read the DNA file: {str(e)}")
+                st.stop()
         
         # 2. Add RNA Overexpression Targets
         for gene in st.session_state.ai_targets:
@@ -687,16 +831,117 @@ if run_button and counts_file and metadata_file:
             "gathered_evidence": [],
             "pathway_data": {},
             "final_report": "",
-            "custom_knowledge": rag_context, # <-- NEW: Pass the PDF text to the AI!
-            "analysis_mode": analysis_mode
+            "custom_knowledge": rag_context, 
+            "analysis_mode": analysis_mode,
+            "discarded_evidence": [], 
+            "ai_filtered_evidence": [],
+            "expert_consensus": ""
         }
         
-        final_state = orchestrator.invoke(initial_state)
+        # --- PHASE 1: GATHERING (The Executor) ---
+        st.session_state.agent_state = initial_state
+        st.session_state.agent_state.update(planner_node(st.session_state.agent_state))
+        st.session_state.agent_state.update(executor_node(st.session_state.agent_state))
         
-        st.session_state.run_complete = True
-        st.session_state.final_report = final_state["final_report"]
-        st.session_state.plan = final_state["plan"]
-        st.session_state.pathway_data = final_state.get("pathway_data", {}) # <-- NEW: Extract pathway data
+        st.session_state.gathering_complete = True
+        st.session_state.run_complete = False # Reset in case of a re-run
+        
+        if not hitl_toggle:
+            # FREIGHT TRAIN MODE: If HITL is off, immediately run Phase 2!
+            st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state)) # <-- ADD THIS
+            st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
+            st.session_state.run_complete = True
+            st.session_state.final_report = st.session_state.agent_state["final_report"]
+            st.session_state.plan = st.session_state.agent_state["plan"]
+            st.session_state.pathway_data = st.session_state.agent_state.get("pathway_data", {})
+            
+        st.rerun() # NEW: Forces Streamlit to cleanly switch to the Pause menu!
+
+# --- PHASE 1.5: THE HUMAN-IN-THE-LOOP PAUSE ---
+if st.session_state.get("gathering_complete") and not st.session_state.get("run_complete") and hitl_toggle:
+    st.markdown("---")
+    st.subheader("⏸️ Human-in-the-Loop: Review Evidence")
+    st.info("The AI has gathered the following PubMed literature. Uncheck any irrelevant papers before generating the final clinical report.")
+    
+    # Flatten the nested PubMed papers into a simple list for the dataframe
+    flat_papers = []
+    for g_idx, g_data in enumerate(st.session_state.agent_state.get("gathered_evidence", [])):
+        papers = g_data.get("evidence", {}).get("PubMed", {}).get("papers", [])
+        for p_idx, p in enumerate(papers):
+            flat_papers.append({
+                "Keep": True,
+                "Score (1-10)": p.get("AI_Score", "?"),     # <-- NEW
+                "AI Reason": p.get("AI_Reason", "N/A"),     # <-- NEW
+                "Gene": g_data["gene"],
+                "Title": p["Title"],
+                "PMID": p["PMID"],
+                "_g_idx": g_idx,  
+                "_p_idx": p_idx   
+            })
+            
+    if flat_papers:
+        df_papers = pd.DataFrame(flat_papers)
+        # Render the interactive Data Editor!
+        edited_df = st.data_editor(
+            df_papers[["Keep", "Score (1-10)", "AI Reason", "Gene", "Title", "PMID"]], 
+            hide_index=True, 
+            use_container_width=True,
+            disabled=["Score (1-10)", "AI Reason", "Gene", "PMID", "Title"] 
+        )
+    else:
+        st.info("💡 **Novelty Detected:** The AI reviewed the retrieved literature but determined none of the papers established a direct, functional link between these specific genes and the disease. This may represent a highly novel biological connection with no prior published precedent.")
+        edited_df = pd.DataFrame()
+    # NEW: Show what the AI automatically discarded
+    ai_discarded = st.session_state.agent_state.get("ai_filtered_evidence", [])
+    if ai_discarded:
+        with st.expander("🤖 AI Pre-Filtered Literature (Auto-Discarded)"):
+            st.info("The AI evaluated up to 10 papers per gene. The following papers scored < 5 and were automatically excluded.")
+            for doc in ai_discarded:
+                st.markdown(f"- **{doc['Gene']}** (Score: {doc['Score']}): *{doc['Title']}* - Reason: `{doc['Reason']}`")
+        
+    # --- THE FINAL TRIGGER ---
+    if st.button("🚀 Step 2: Approve Evidence & Synthesize Report", type="primary", use_container_width=True):
+        with st.spinner("✍️ Synthesizing the final clinical report..."):
+            approved_evidence = copy.deepcopy(st.session_state.agent_state["gathered_evidence"])
+            discarded_papers = [] # <-- NEW: Temporary list for trash
+            
+            if not edited_df.empty:
+                # Clear out the original papers
+                for g_data in approved_evidence:
+                    if "PubMed" in g_data.get("evidence", {}) and "papers" in g_data["evidence"]["PubMed"]:
+                        g_data["evidence"]["PubMed"]["papers"] = []
+                
+                # Loop through the table to sort checked vs unchecked
+                for i, row in edited_df.iterrows():
+                    g_idx = flat_papers[i]["_g_idx"]
+                    p_idx = flat_papers[i]["_p_idx"]
+                    original_paper = st.session_state.agent_state["gathered_evidence"][g_idx]["evidence"]["PubMed"]["papers"][p_idx]
+                    
+                    if row["Keep"]:
+                        # Keep it for the report
+                        approved_evidence[g_idx]["evidence"]["PubMed"]["papers"].append(original_paper)
+                    else:
+                        # Toss it in the trash can
+                        discarded_papers.append({
+                            "Gene": flat_papers[i]["Gene"],
+                            "Title": original_paper.get("Title", "Unknown Title"),
+                            "PMID": original_paper.get("PMID", "Unknown PMID")
+                        })
+                        
+            # Save the clean evidence AND the trash back to the AI's brain
+            st.session_state.agent_state["gathered_evidence"] = approved_evidence
+            st.session_state.agent_state["discarded_evidence"] = discarded_papers
+            
+            # --- PHASE 2: TUMOR BOARD & WRITING ---
+            st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state)) # <-- ADD THIS
+            st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
+            
+            # Mark as finished and refresh the page to show the results
+            st.session_state.run_complete = True
+            st.session_state.final_report = st.session_state.agent_state["final_report"]
+            st.session_state.plan = st.session_state.agent_state["plan"]
+            st.session_state.pathway_data = st.session_state.agent_state.get("pathway_data", {})
+            st.rerun()
         
 # ==========================================
 # 5. RENDER RESULTS & CHATBOT (From Memory)
@@ -748,6 +993,36 @@ if st.session_state.run_complete:
     st.markdown("### 📄 Final Synthesized Clinical Report")
     st.info("This report was autonomously written by the Medical Writer LLM based solely on validated tool data.")
     st.markdown(st.session_state.final_report)
+    
+    # --- NEW: THE CLINICAL AUDIT TRAIL & BIBLIOGRAPHY ---
+    st.markdown("### 📚 Reference Library & Evidence Audit")
+    
+    # 1. Show the Papers that WERE used
+    used_evidence = st.session_state.agent_state.get("gathered_evidence", [])
+    if used_evidence:
+        with st.expander("✅ PubMed Literature Included in Synthesis"):
+            for g_data in used_evidence:
+                papers = g_data.get("evidence", {}).get("PubMed", {}).get("papers", [])
+                if papers:
+                    st.markdown(f"**Target: {g_data['gene']}**")
+                    for p in papers:
+                        st.markdown(f"- **PMID {p['PMID']}**: *{p['Title']}*")
+    
+    # 2. Show the Papers that the Human threw out
+    discarded = st.session_state.agent_state.get("discarded_evidence", [])
+    if discarded:
+        with st.expander("🗑️ Manually Filtered (Discarded) Evidence"):
+            st.warning("The following literature was manually excluded by the user and hidden from the AI:")
+            for idx, paper in enumerate(discarded):
+                st.markdown(f"- **{paper['Gene']}** (PMID {paper['PMID']}): *{paper['Title']}*")
+                
+    # 3. Show the Papers that the AI threw out
+    ai_discarded = st.session_state.agent_state.get("ai_filtered_evidence", [])
+    if ai_discarded:
+        with st.expander("🤖 AI Pre-Filtered Literature (Auto-Discarded)"):
+            st.info("The AI evaluated up to 10 papers per gene. The following papers scored < 5 and were automatically excluded.")
+            for doc in ai_discarded:
+                st.markdown(f"- **{doc['Gene']}** (Score: {doc['Score']}): *{doc['Title']}* - Reason: `{doc['Reason']}`")
     
     # --- EXPORT MENU (HTML & DOCX) ---
     st.markdown("### 💾 Export Options")
