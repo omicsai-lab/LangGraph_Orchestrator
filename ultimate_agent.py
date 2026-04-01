@@ -471,8 +471,8 @@ def clinical_review_node(state: AgentState):
     Clean Evidence: {json.dumps(state.get('gathered_evidence'))}
     Pathways: {json.dumps(state.get('pathway_data'))}
     
-    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context, tumor microenvironment, and biological plausibility of these targets.
-    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability, clinical trial viability, and translational challenges of these targets.
+    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context and biological plausibility. CRITICAL SANITY CHECK: If the upregulated genes are canonical markers for a completely different tissue type (e.g., breast tissue genes in a melanoma prompt), you MUST explicitly call this out as a probable data mismatch or lineage artifact. Do not force a biological connection if one does not logically exist.
+    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability and clinical trial viability. If the Pathologist flags a tissue mismatch, advise extreme caution regarding clinical utility.
     """
     response = llm.invoke([HumanMessage(content=prompt)])
     return {"expert_consensus": response.content}
@@ -488,13 +488,17 @@ def writer_node(state: AgentState):
         Write a beautiful, pathway-centric scientific report answering the user's prompt. 
         
         CRITICAL GUARDRAILS:
-        1. TONE AND STYLE: NEVER break the fourth wall. Do NOT say "per your guardrails", "in the provided evidence", or "your PubMed pull". Write confidently as if you are authoring a published review article in a high-impact oncology journal.
+        1. TONE AND STYLE: NEVER break the fourth wall. Write confidently as if you are authoring a published review article in a high-impact oncology journal. Do NOT simplify or reduce the scientific depth. Maintain maximum academic rigor, but use **bold text** for gene names and critical biological processes to guide the reader's eye through your dense prose.
         2. BIOLOGICAL TRIAGE: Explicitly dismiss pseudogenes and ncRNAs as non-coding artifacts.
         3. ACRONYM COLLISIONS: Be highly aware of literature false-positives. If PubMed returns papers where the gene symbol is used as an acronym for a drug (e.g., CEL = Celastrol) or a biological process (e.g., LPO = Lipid Peroxidation), YOU MUST EXPLICITLY CALL THIS OUT as a literature mismatch. Do not treat the paper as evidence for the gene.
         4. SYSTEMS APPROACH: Do NOT list genes one by one. Group them by their pathway and discuss them as a network.
         5. GUILT BY ASSOCIATION: If a target lacks direct literature or trials, look at its "STRING_Interactions" data. Discuss whether targeting its direct protein neighbors might offer a backdoor therapeutic strategy.
+        6. THE SANITY CHECK: If the Expert Consensus (the Pathologist) flags that these genes belong to a different tissue lineage or represent a data mismatch, DO NOT try to invent a novel connection. Explicitly state in the Executive Summary and the Translational Outlook that the data profile appears incongruent with the stated cancer type.
         
         REQUIRED REPORT STRUCTURE:
+        ## 📊 Executive Summary
+        [Write a concise 3-4 sentence high-level overview of the major findings and actionable next steps.]
+        
         ## 🕸️ Systems Biology & Pathway Dysregulation
         [Write a multi-paragraph synthesis of the KEGG pathway data. How do these networks (and their overlapping genes) interact to drive the tumor microenvironment, metabolic reprogramming, or immune evasion?]
         
@@ -889,7 +893,7 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
             disabled=["Score (1-10)", "AI Reason", "Gene", "PMID", "Title"] 
         )
     else:
-        st.info("💡 **Novelty Detected:** The AI reviewed the retrieved literature but determined none of the papers established a direct, functional link between these specific genes and the disease. This may represent a highly novel biological connection with no prior published precedent.")
+        st.info("💡 **Literature Triage:** The AI reviewed the retrieved literature but determined none of the papers established a direct, functional link between these specific targets and the selected disease. This may represent a highly novel biological connection, OR it may indicate that these genes are not functionally relevant to this specific cancer lineage (e.g., a data mismatch).")
         edited_df = pd.DataFrame()
     # NEW: Show what the AI automatically discarded
     ai_discarded = st.session_state.agent_state.get("ai_filtered_evidence", [])
@@ -990,6 +994,13 @@ if st.session_state.run_complete:
         else:
             st.info("No statistically significant pathways found for these targets.")
 
+    # --- NEW: TUMOR BOARD TRANSCRIPT ---
+    consensus = st.session_state.agent_state.get("expert_consensus", "")
+    if consensus:
+        with st.expander("🧑‍⚕️ View Raw Tumor Board Debate (Pathologist vs. Oncologist)"):
+            st.info("This is the internal reasoning generated by the multi-agent experts before the Medical Writer synthesized the final report.")
+            st.markdown(consensus)
+
     st.markdown("### 📄 Final Synthesized Clinical Report")
     st.info("This report was autonomously written by the Medical Writer LLM based solely on validated tool data.")
     st.markdown(st.session_state.final_report)
@@ -999,14 +1010,20 @@ if st.session_state.run_complete:
     
     # 1. Show the Papers that WERE used
     used_evidence = st.session_state.agent_state.get("gathered_evidence", [])
-    if used_evidence:
-        with st.expander("✅ PubMed Literature Included in Synthesis"):
-            for g_data in used_evidence:
-                papers = g_data.get("evidence", {}).get("PubMed", {}).get("papers", [])
-                if papers:
-                    st.markdown(f"**Target: {g_data['gene']}**")
-                    for p in papers:
-                        st.markdown(f"- **PMID {p['PMID']}**: *{p['Title']}*")
+    has_kept_papers = False
+    
+    with st.expander("✅ PubMed Literature Included in Synthesis"):
+        for g_data in used_evidence:
+            papers = g_data.get("evidence", {}).get("PubMed", {}).get("papers", [])
+            if papers:
+                has_kept_papers = True
+                st.markdown(f"**Target: {g_data['gene']}**")
+                for p in papers:
+                    st.markdown(f"- **PMID {p['PMID']}**: *{p['Title']}*")
+        
+        # NEW: If the human or AI threw everything in the trash, print this message!
+        if not has_kept_papers:
+            st.info("No experimental literature passed the AI quality filter for inclusion. The report relies entirely on systems biology networks and pathway data.")
     
     # 2. Show the Papers that the Human threw out
     discarded = st.session_state.agent_state.get("discarded_evidence", [])
