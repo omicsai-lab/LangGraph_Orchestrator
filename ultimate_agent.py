@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from inmoose.edgepy import DGEList, glmFit, glmLRT
 from patsy import dmatrix
 # --- NEW RAG IMPORTS ---
+from langchain_core.documents import Document as LCDocument # <-- ALIAS FIX
 from PyPDF2 import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
@@ -192,42 +193,42 @@ def get_onco_data(hugo, alteration, tumor_type):
         return {"status": f"Request failed: {str(e)}"}
 
 @st.cache_data(ttl="1d", show_spinner=False)
-def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases=""):
-    # Clean up the aliases into a search string if they exist
+def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interactors=None):
+    if interactors is None: interactors = []
+    
     alias_query = ""
     if aliases and aliases != "Unknown":
-        # Take up to the first 2 aliases to prevent massive URL queries
-        alias_list = [a.strip() for a in aliases.split(',')][:2]
+        # NEW: Only keep aliases longer than 3 characters to prevent massive acronym pollution!
+        alias_list = [a.strip() for a in aliases.split(',') if len(a.strip()) > 3][:2]
         if alias_list:
-            alias_query = " OR " + " OR ".join([f"{a}[Title/Abstract]" for a in alias_list])
+            alias_query = " OR " + " OR ".join([f"{a}[TIAB]" for a in alias_list])
 
-    # NEW: Using [TIAB] forces PubMed to only look in the Title/Abstract, drastically reducing noise!
-    if "Discovery" in mode:
-        search_query = f"({gene}[TIAB]{alias_query}) AND {tumor_type}[TIAB] AND (immunotherapy OR biomarker OR target)"
+    # --- NEW: UNCONDITIONAL NETWORK PULL FOR DISCOVERY ---
+    if "Discovery" in mode and interactors:
+        network_nodes = [gene] + interactors
+        network_query_str = " OR ".join([f"{n}[TIAB]" for n in network_nodes])
+        broad_query = f"({network_query_str}{alias_query}) AND {tumor_type}[TIAB]"
+        prov_step_1 = f"**Phase 1 (Broad Network Pull):** Expanded query to include STRING interactors: `[{broad_query}]`."
     else:
-        search_query = f"({gene}[TIAB]{alias_query}) AND {tumor_type}[TIAB] AND targeted therapy"
-        
+        broad_query = f"({gene}[TIAB]{alias_query}) AND {tumor_type}[TIAB]"
+        prov_step_1 = f"**Phase 1 (Broad Target Pull):** PubMed query `[{broad_query}]`."
+    
     search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-    # NEW: Fetch up to 10 candidates so the AI has plenty to choose from
-    search_params = {"db": "pubmed", "term": search_query, "retmode": "json", "retmax": 10}
+    search_params = {"db": "pubmed", "term": broad_query, "retmode": "json", "retmax": 40}
     
     try:
         res = requests.get(search_url, params=search_params)
-        if res.status_code != 200:
-            return {"status": f"PubMed Search Error: {res.status_code}"}
+        if res.status_code != 200: return {"status": f"Search Error: {res.status_code}"}
             
         id_list = res.json().get("esearchresult", {}).get("idlist", [])
-        if not id_list: 
-            return {"status": "No experimental literature found."}
+        if not id_list: return {"status": "No experimental literature found."}
             
         time.sleep(0.5) 
-        
         fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
         fetch_params = {"db": "pubmed", "id": ",".join(id_list), "retmode": "xml"}
         
         fetch_res = requests.get(fetch_url, params=fetch_params)
-        if fetch_res.status_code != 200:
-            return {"status": f"PubMed Fetch Error: {fetch_res.status_code}"}
+        if fetch_res.status_code != 200: return {"status": "PubMed Fetch Error"}
             
         papers = []
         root = ET.fromstring(fetch_res.content)
@@ -235,21 +236,39 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases=""):
             pmid = article.find('.//PMID').text if article.find('.//PMID') is not None else "Unknown"
             title = article.find('.//ArticleTitle').text if article.find('.//ArticleTitle') is not None else "No Title"
             
-            abstract_text = ""
             abstract_nodes = article.findall('.//AbstractText')
-            if abstract_nodes:
-                abstract_text = " ".join([node.text for node in abstract_nodes if node.text])
-            else:
-                abstract_text = "No abstract available."
+            abstract_text = " ".join([node.text for node in abstract_nodes if node.text]) if abstract_nodes else ""
                 
-            papers.append({
-                "PMID": pmid, 
-                "Title": title,
-                "Abstract": abstract_text[:1000]
-            })
+            if abstract_text: 
+                papers.append({"PMID": pmid, "Title": title, "Abstract": abstract_text[:1500]})
+                
+        if not papers: return {"status": "No abstracts available to embed."}
+
+        # --- 2. SEMANTIC FILTER (FAISS VECTOR DB) ---
+        print(f"      -> Embedding {len(papers)} abstracts into FAISS for {gene} network...")
+        docs = [LCDocument(page_content=f"Title: {p['Title']}\nAbstract: {p['Abstract']}", metadata=p) for p in papers]
+        
+        embeddings = OpenAIEmbeddings(api_key=openai_key)
+        vectorstore = FAISS.from_documents(docs, embeddings)
+        
+        if "Discovery" in mode:
+            semantic_query = f"Novel biomarkers, signaling pathways, lipid metabolism, immunotherapy targets, and resistance mechanisms in {tumor_type}."
+        else:
+            semantic_query = f"FDA approved targeted therapy, survival outcomes, and clinical trial results for {tumor_type}."
             
-        time.sleep(0.5)
-        return {"status": "Success", "papers": papers}
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+        relevant_docs = retriever.invoke(semantic_query)
+        top_papers = [{"PMID": d.metadata["PMID"], "Title": d.metadata["Title"], "Abstract": d.metadata["Abstract"]} for d in relevant_docs]
+        
+        # --- 3. PROVENANCE LOGGING ---
+        provenance = [
+            prov_step_1 + f" Yielded {len(id_list)} candidates.",
+            f"**Phase 2 (Semantic Sorting):** Embedded {len(papers)} valid abstracts into FAISS Vector DB.",
+            f"**Phase 3 (Concept Retrieval):** Extracted top 10 papers by mathematical proximity to: *'{semantic_query}'*.",
+            f"**Phase 4 (Expert Review):** Top semantic matches passed to the AI Scorer for strict clinical triage."
+        ]
+        
+        return {"status": "Success", "papers": top_papers, "provenance": provenance}
         
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
@@ -382,13 +401,26 @@ def executor_node(state: AgentState):
         if "oncokb" in plan_text:
             report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
             
+        # 1. FETCH THE NETWORK FIRST!
+        if "Discovery" in state.get("analysis_mode", "Clinical Triage"):
+            print(f"      -> Fetching STRING protein network for {hugo}...")
+            report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
+            
+        # 2. THEN FETCH PUBMED
         if "pubmed" in plan_text:
+            # EXTRACT THE NETWORK WE JUST FETCHED!
+            interactors = report.get("evidence", {}).get("STRING_Interactions", {}).get("interacting_proteins", [])
+            
             pubmed_data = search_pubmed(
                 hugo, 
                 tumor_type, 
                 mode=state.get("analysis_mode", "Clinical Triage"),
-                aliases=gene_context.get("aliases", "")
+                aliases=gene_context.get("aliases", ""),
+                interactors=interactors # <-- Pass the network into the tool!
             )
+            
+            # NEW: Save the Semantic Search Provenance Log!
+            report["evidence"]["PubMed_Provenance"] = pubmed_data.get("provenance", [])
             
             # --- AI RELEVANCE SCORER (OVERSAMPLE & FILTER) ---
             if pubmed_data.get("status") == "Success" and pubmed_data.get("papers"):
@@ -405,13 +437,16 @@ def executor_node(state: AgentState):
                     if len(good_papers) >= 3:
                         break # We found 3 good papers! Stop grading to save OpenAI tokens.
                         
+                    # NEW: Tell the scorer to accept network interactions!
+                    network_str = f" OR its immediate functional network ({', '.join(interactors)})" if interactors else ""
+                    
                     eval_prompt = f"""
-                    Evaluate this abstract's relevance to the gene {hugo} ({bio_name}) in {tumor_type}.
+                    Evaluate this abstract's relevance to the target {hugo} ({bio_name}){network_str} in {tumor_type}.
                     Biological Function of {hugo}: {bio_summary}
                     
                     CRITICAL RUBRIC:
-                    - Score 1-4: Acronym collision (e.g., {hugo} refers to a drug/procedure), completely unrelated disease, or animal model without clinical relevance.
-                    - Score 5-10: Relevant. The gene is mentioned in a functional, prognostic, or therapeutic context.
+                    - Score 1-4: Acronym collision (e.g., the gene symbol refers to a drug/procedure), completely unrelated disease, or irrelevant biology.
+                    - Score 5-10: Relevant. The primary gene {hugo} {network_str} is mentioned in a functional, prognostic, or therapeutic context. (Score highly if it validates the target's network!).
                     
                     Title: {p['Title']}
                     Abstract: {p['Abstract'][:800]}
@@ -449,10 +484,6 @@ def executor_node(state: AgentState):
                 pubmed_data["papers"] = good_papers
                         
             report["evidence"]["PubMed"] = pubmed_data
-            
-        if "Discovery" in state.get("analysis_mode", "Clinical Triage"):
-            print(f"   -> Fetching STRING protein network for {hugo}...")
-            report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
 
         if "clinicaltrials" in plan_text or "trials" in plan_text:
             print(f"   -> Fetching Clinical Trials for {hugo}...")
@@ -502,8 +533,15 @@ def writer_node(state: AgentState):
         ## 🕸️ Systems Biology & Pathway Dysregulation
         [Write a multi-paragraph synthesis of the KEGG pathway data. How do these networks (and their overlapping genes) interact to drive the tumor microenvironment, metabolic reprogramming, or immune evasion?]
         
-        ## 🔬 Targetable Hubs & Experimental Literature
-        [Synthesize the PubMed literature conceptually. Discuss the valid genes as a group. If papers suffered from Acronym Collisions, note that the literature is currently lacking for the specific genes due to nomenclature overlap.]
+        ## 🔬 Targetable Hubs & Translational Risk Tiers
+        [Synthesize the PubMed literature conceptually, but you MUST categorize each evaluated gene into one of the following Translational Risk Tiers based on the evidence:]
+        
+        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: The gene has direct PubMed literature in this specific cancer. Ready for translational validation.
+        * **🟡 Tier 2: Network Dependencies (Moderate Risk)**: The gene lacks direct literature, but its protein network (STRING interactors) or pathways are highly actionable in this cancer. Do not target the gene directly; intervene at the network level.
+        * **🟠 Tier 3: Orphan Signals (High Risk)**: Upregulated, but no literature, no clear pathways, and no actionable interactors. Highly speculative; requires orthogonal wet-lab validation before funding is allocated.
+        * **🔴 Tier 4: Probable Artifacts (Do Not Pursue)**: Pseudogenes, lineage mismatches (e.g., breast genes in melanoma), or acronym collisions.
+        
+        [Discuss the genes under their appropriate Tier headers.]
         
         ## 🏥 Translational Outlook
         [Summarize any relevant trials, or state that these novel network targets currently lack specific recruiting trials. Explicitly comment on WHY this biological connection is novel and HOW it is biologically plausible based on the Pathologist/Oncologist consensus.]
@@ -1007,6 +1045,18 @@ if st.session_state.run_complete:
     
     # --- NEW: THE CLINICAL AUDIT TRAIL & BIBLIOGRAPHY ---
     st.markdown("### 📚 Reference Library & Evidence Audit")
+    
+    # 0. THE GLASS BOX PROVENANCE
+    used_evidence = st.session_state.agent_state.get("gathered_evidence", [])
+    if used_evidence:
+        with st.expander("🔍 View AI Semantic Search Algorithm (Provenance)"):
+            st.info("Unlike traditional black-box AI search engines, this pipeline uses a deterministic 'Glass Box' methodology combining broad E-Utilities retrieval with FAISS semantic embedding.")
+            for g_data in used_evidence:
+                provenance = g_data.get("evidence", {}).get("PubMed_Provenance", [])
+                if provenance:
+                    st.markdown(f"#### **Search Strategy for {g_data['gene']}**")
+                    for step in provenance:
+                        st.markdown(f"- {step}")
     
     # 1. Show the Papers that WERE used
     used_evidence = st.session_state.agent_state.get("gathered_evidence", [])
