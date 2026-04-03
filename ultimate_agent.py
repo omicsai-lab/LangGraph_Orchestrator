@@ -9,6 +9,9 @@ import time
 import copy # <-- NEW: Needed for HITL evidence editing
 import xml.etree.ElementTree as ET
 import markdown
+import gseapy as gp
+import matplotlib.pyplot as plt
+from gseapy.plot import gseaplot
 from io import BytesIO
 from docx import Document
 from htmldocx import HtmlToDocx
@@ -18,6 +21,7 @@ from inmoose.edgepy import DGEList, glmFit, glmLRT
 from patsy import dmatrix
 # --- NEW RAG IMPORTS ---
 from langchain_core.documents import Document as LCDocument # <-- ALIAS FIX
+from langchain_community.callbacks import get_openai_callback
 from PyPDF2 import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
@@ -77,6 +81,10 @@ if "gathering_complete" not in st.session_state:
     st.session_state.gathering_complete = False
 if "agent_state" not in st.session_state:
     st.session_state.agent_state = {}
+if "total_tokens" not in st.session_state:
+    st.session_state.total_tokens = 0
+if "total_cost" not in st.session_state:
+    st.session_state.total_cost = 0.0
 
 # ==========================================
 # 1. GRAPH STATE & SCHEMAS
@@ -128,43 +136,87 @@ def get_gene_info(hugo_symbol):
         return {"status": "Gene info not found."}
     except Exception as e:
         return {"status": f"API Error: {str(e)}"}
-
+    
 @st.cache_data(ttl="1d", show_spinner=False)
-def get_enriched_pathways(gene_list):
-    """Uses the Enrichr API to find overlapping biological pathways for a list of genes."""
-    if not gene_list:
-        return "No genes provided for pathway analysis."
-        
-    enrichr_add_url = 'https://maayanlab.cloud/Enrichr/addList'
-    payload = {
-        'list': (None, '\n'.join(gene_list)),
-        'description': (None, 'OncoApp_Gene_List')
-    }
+def fetch_normal_tissue_profile(hugo_symbol):
+    """Acts as a proxy for the GTEx / Human Protein Atlas databases."""
+    llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key)
+    
+    sys_msg = """You are a Genotype-Tissue Expression (GTEx) and Human Protein Atlas database proxy. 
+    Output a strict, 1-sentence summary of where this gene is predominantly expressed in normal, healthy human tissue. 
+    Be highly specific (e.g., 'Predominantly expressed in the exocrine pancreas and lactating mammary glands'). 
+    If it is ubiquitous across all tissues, explicitly state 'Ubiquitously expressed'."""
     
     try:
-        # 1. Upload the list to Enrichr
-        res_add = requests.post(enrichr_add_url, files=payload)
-        if not res_add.ok: return "Enrichr API upload failed."
-        user_list_id = res_add.json().get('userListId')
-        
-        # 2. Query the KEGG Pathway Database
-        enrichr_query_url = f'https://maayanlab.cloud/Enrichr/enrich?userListId={user_list_id}&backgroundType=KEGG_2021_Human'
-        res_query = requests.get(enrichr_query_url)
-        if not res_query.ok: return "Enrichr KEGG query failed."
-        
-        results = res_query.json().get('KEGG_2021_Human', [])
-        
-        # 3. Extract the top 3 most significant pathways
-        top_pathways = []
-        for r in results[:3]:
-            top_pathways.append({
-                "pathway": r[1],
-                "p_value": r[2],
-                "overlapping_genes": r[5]
-            })
-        return {"status": "Success", "pathways": top_pathways}
+        res = llm.invoke([
+            SystemMessage(content=sys_msg), 
+            HumanMessage(content=f"Gene: {hugo_symbol}")
+        ])
+        return res.content
     except Exception as e:
-        return {"status": f"Enrichr Request failed: {str(e)}"}
+        return "GTEx proxy unavailable."
+
+@st.cache_resource(ttl="1d", show_spinner=False)
+def run_gsea_analysis(full_df):
+    """Runs local GSEA using gseapy on the entire ranked expression profile."""
+    # 1. Prepare the ranking metric: -log10(padj) * sign(log2FoldChange)
+    df = full_df.dropna(subset=['log2FoldChange', 'padj']).copy()
+    df['rank_metric'] = -np.log10(df['padj'] + 1e-300) * np.sign(df['log2FoldChange'])
+    
+    # 2. Sort from most upregulated to most downregulated
+    df = df.sort_values('rank_metric', ascending=False)
+    rnk = df[['rank_metric']]
+    
+    try:
+        try:
+            # 3. Attempt GSEA Prerank locally with multiprocessing
+            pre_res = gp.prerank(
+                rnk=rnk, 
+                gene_sets='KEGG_2021_Human',
+                threads=4, 
+                min_size=5, 
+                max_size=1000,
+                permutation_num=100, 
+                outdir=None, 
+                seed=42
+            )
+        except Exception as thread_e:
+            print(f"⚠️ Multiprocessing warning: {thread_e}. Falling back to single thread...")
+            # 3b. Safe fallback for Windows/Anaconda environments
+            pre_res = gp.prerank(
+                rnk=rnk, 
+                gene_sets='KEGG_2021_Human',
+                threads=1, 
+                min_size=5, 
+                max_size=1000,
+                permutation_num=100, 
+                outdir=None, 
+                seed=42
+            )
+        
+        res_df = pre_res.res2d
+        
+        # 4. Filter for significantly enriched pathways (Grab top 10 to ensure we have enough Up and Down options)
+        sig_pw = res_df[res_df['FDR q-val'] < 0.05].head(10)
+        
+        if sig_pw.empty:
+            return {"status": "No statistically significant pathways found by GSEA.", "pathways": []}
+            
+        top_pathways = []
+        for idx, row in sig_pw.iterrows():
+            # gseapy returns lead genes separated by semicolons
+            lead_genes = row['Lead_genes'].split(';')
+            top_pathways.append({
+                "pathway": row['Term'],
+                "p_value": row['NOM p-val'],
+                "nes": row.get('NES', 0), # <-- NEW: Track the direction of the pathway!
+                "overlapping_genes": lead_genes
+            })
+            
+        return {"status": "Success", "pathways": top_pathways, "gsea_obj": pre_res}
+        
+    except Exception as e:
+        return {"status": f"GSEA failed: {str(e)}"}
 
 @st.cache_data(ttl="1d", show_spinner=False)
 def get_onco_data(hugo, alteration, tumor_type):
@@ -332,6 +384,86 @@ def get_protein_interactions(hugo_symbol):
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
 
+@st.cache_data(ttl="1d", show_spinner=False)
+def fetch_target_tractability(hugo_symbol):
+    """Fetches Druggability (Tractability) and Essentiality from the Open Targets API."""
+    url = "https://api.platform.opentargets.org/api/v4/graphql"
+    
+    # NEW: 'entity' changed to 'object' to match the V4 schema
+    query = """
+    query targetSearch($queryString: String!) {
+      search(queryString: $queryString, entityNames: ["target"]) {
+        hits {
+          object {
+            ... on Target {
+              id
+              approvedSymbol
+              tractability {
+                label
+                modality
+                value
+              }
+              depMapEssentiality {
+                screens {
+                  depmapId
+                  diseaseFromSource
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    variables = {"queryString": hugo_symbol}
+    try:
+        res = requests.post(url, json={"query": query, "variables": variables})
+        if res.status_code == 200:
+            data = res.json()
+            hits = data.get("data", {}).get("search", {}).get("hits", [])
+            for hit in hits:
+                # NEW: Python now extracts from the 'object' dictionary
+                obj = hit.get("object", {})
+                if obj and obj.get("approvedSymbol") == hugo_symbol:
+                    
+                    # 1. Parse Tractability
+                    tractability = obj.get("tractability") or []
+                    is_druggable = False
+                    modalities = []
+                    for t in tractability:
+                        if t.get("value") == True:
+                            is_druggable = True
+                            modalities.append(f"{t.get('modality')} ({t.get('label')})")
+                    
+                    # 2. Parse Essentiality (Handling the OpenTargets List Schema)
+                    essentiality_data = obj.get("depMapEssentiality") or []
+                    is_essential = False
+                    essential_screens = 0
+                    
+                    # OpenTargets returns a list, so we safely check if it has items and grab the first one
+                    if isinstance(essentiality_data, list) and len(essentiality_data) > 0:
+                        screens = essentiality_data[0].get("screens", [])
+                        essential_screens = len(screens)
+                        is_essential = essential_screens > 0
+                    
+                    # --- NEW: EXPLICIT 'NO DATA' DECLARATION ---
+                    if not is_druggable and not is_essential:
+                        status_msg = "Target exists in OpenTargets, but contains ZERO tractability or DepMap essentiality data."
+                    else:
+                        status_msg = "Success"
+
+                    return {
+                        "status": status_msg,
+                        "is_druggable": is_druggable,
+                        "tractability_buckets": modalities[:5],
+                        "is_depmap_essential": is_essential,
+                        "essential_cell_lines": essential_screens
+                    }
+            return {"status": f"Target '{hugo_symbol}' not found in OpenTargets Database. Verify HGNC symbol."}
+        return {"status": f"API Error: {res.status_code}"}
+    except Exception as e:
+        return {"status": f"Request failed: {str(e)}"}
+
 def process_pdf_for_rag(pdf_file):
     """Reads a PDF, splits it into chunks, and builds a FAISS vector database."""
     reader = PdfReader(pdf_file)
@@ -367,9 +499,10 @@ def planner_node(state: AgentState):
     sys_msg = """You are an expert Clinical Bioinformatics Planner. 
     Analyze the user prompt and genes. Output a step-by-step plan to gather data.
     Available Tools: 
-    1. 'OncoKB' (FDA drugs)
-    2. 'PubMed' (Experimental research)
-    3. 'ClinicalTrials' (Actively recruiting trials)"""
+    1. 'OpenTargets' (Druggability Tractability & CRISPR Essentiality) # <-- NEW
+    2. 'OncoKB' (FDA drugs)
+    3. 'PubMed' (Experimental research)
+    4. 'ClinicalTrials' (Actively recruiting trials)"""
     
     context = f"User Prompt: {state.get('user_prompt')}\nGenes: {state.get('significant_genes')}"
     response = structured_llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=context)])
@@ -381,11 +514,6 @@ def executor_node(state: AgentState):
     genes = state.get("significant_genes", [])
     new_evidence = []
     
-    # NEW: Run Pathway Analysis for the entire group of targets
-    print("   -> Running KEGG Pathway Analysis via Enrichr...")
-    gene_symbols = [g.get("hugo") for g in genes]
-    pathway_results = get_enriched_pathways(gene_symbols)
-    
     for gene_info in genes:
         hugo = gene_info.get("hugo")
         alt = gene_info.get("alteration")
@@ -396,7 +524,16 @@ def executor_node(state: AgentState):
         print(f"   -> Fetching biological context for {hugo}...")
         gene_context = get_gene_info(hugo)
         
+        # --- NEW: GTEX TISSUE SANITY CHECK ---
+        print(f"      -> Profiling GTEx normal tissue distribution for {hugo}...")
+        tissue_profile = fetch_normal_tissue_profile(hugo)
+        gene_context["normal_tissue_gtex"] = tissue_profile # Add it to the biology dictionary!
+        
         report = {"gene": hugo, "alteration": alt, "source": source_tag, "biology": gene_context, "evidence": {}}
+        
+        # --- NEW: FETCH OPEN TARGETS TRACTABILITY & ESSENTIALITY ---
+        print(f"      -> Fetching Tractability & Essentiality for {hugo}...")
+        report["evidence"]["OpenTargets"] = fetch_target_tractability(hugo)
         
         if "oncokb" in plan_text:
             report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
@@ -490,8 +627,9 @@ def executor_node(state: AgentState):
             report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
             
         new_evidence.append(report)
+        time.sleep(1.5) # <-- NEW: Prevent OpenTargets/PubMed API rate-limiting!
         
-    return {"gathered_evidence": new_evidence, "pathway_data": pathway_results, "ai_filtered_evidence": state.get("ai_filtered_evidence", [])}
+    return {"gathered_evidence": new_evidence, "pathway_data": state.get("pathway_data"), "ai_filtered_evidence": state.get("ai_filtered_evidence", [])}
 
 def clinical_review_node(state: AgentState):
     print("🧑‍⚕️ [NODE: Clinical Review] Pathologist and Oncologist are debating...")
@@ -502,8 +640,9 @@ def clinical_review_node(state: AgentState):
     Clean Evidence: {json.dumps(state.get('gathered_evidence'))}
     Pathways: {json.dumps(state.get('pathway_data'))}
     
-    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context and biological plausibility. CRITICAL SANITY CHECK: If the upregulated genes are canonical markers for a completely different tissue type (e.g., breast tissue genes in a melanoma prompt), you MUST explicitly call this out as a probable data mismatch or lineage artifact. Do not force a biological connection if one does not logically exist.
-    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability and clinical trial viability. If the Pathologist flags a tissue mismatch, advise extreme caution regarding clinical utility.
+    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context and biological plausibility. CRITICAL SANITY CHECK: You MUST explicitly compare the gene's "normal_tissue_gtex" profile (found in the Clean Evidence) against the user's specified Cancer Type. If the gene is a canonical marker for a completely different tissue type (e.g., a pancreas gene in a melanoma sample), you MUST flag this as a probable lineage artifact or sample contamination.
+    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability and clinical trial viability. You MUST explicitly reference the OpenTargets Tractability and DepMap Essentiality data provided in the Clean Evidence to justify your assessment. If the Pathologist flags a tissue mismatch, advise extreme caution regarding clinical utility.
+    Third, speak as a BIOINFORMATICS AUDITOR: In 1 paragraph, audit the PubMed literature for Acronym Collisions. (e.g., if the gene symbol is 'CEL' but the abstract is talking about 'CEL cells' or 'Celastrol', or 'PPL' meaning a polymer). If you detect a collision or biologically disconnected paper, explicitly name it and command the Medical Writer to ignore it.
     """
     response = llm.invoke([HumanMessage(content=prompt)])
     return {"expert_consensus": response.content}
@@ -528,17 +667,17 @@ def writer_node(state: AgentState):
         
         REQUIRED REPORT STRUCTURE:
         ## 📊 Executive Summary
-        [Write a concise 3-4 sentence high-level overview of the major findings and actionable next steps.]
+        [Write a concise 3-4 sentence high-level overview. YOU MUST START by explicitly explaining to the reader WHY these specific genes were selected (e.g., "These targets were autonomously selected because they are the primary drivers of the [Insert Top KEGG Pathway Here] cluster identified in the patient's differential expression profile.") Then summarize actionable next steps.]
         
         ## 🕸️ Systems Biology & Pathway Dysregulation
         [Write a multi-paragraph synthesis of the KEGG pathway data. How do these networks (and their overlapping genes) interact to drive the tumor microenvironment, metabolic reprogramming, or immune evasion?]
         
         ## 🔬 Targetable Hubs & Translational Risk Tiers
-        [Synthesize the PubMed literature conceptually, but you MUST categorize each evaluated gene into one of the following Translational Risk Tiers based on the evidence:]
+        [Synthesize the literature conceptually, but you MUST categorize each evaluated gene into one of the following Translational Risk Tiers based strictly on its OpenTargets Tractability and DepMap Essentiality data:]
         
-        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: The gene has direct PubMed literature in this specific cancer. Ready for translational validation.
-        * **🟡 Tier 2: Network Dependencies (Moderate Risk)**: The gene lacks direct literature, but its protein network (STRING interactors) or pathways are highly actionable in this cancer. Do not target the gene directly; intervene at the network level.
-        * **🟠 Tier 3: Orphan Signals (High Risk)**: Upregulated, but no literature, no clear pathways, and no actionable interactors. Highly speculative; requires orthogonal wet-lab validation before funding is allocated.
+        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: The gene is classified by OpenTargets as highly Druggable (Tractable via Small Molecule, Antibody, or PROTAC) AND/OR it is highly Essential in DepMap CRISPR screens. Ready for translational validation.
+        * **🟡 Tier 2: Network Dependencies (Moderate Risk)**: The gene is biologically relevant but lacks direct OpenTargets druggability (e.g., intracellular and non-essential). However, its STRING interactors or pathways are actionable. Intervene at the network level.
+        * **🟠 Tier 3: Orphan Signals (High Risk)**: The gene is Not Tractable, Not Essential in DepMap, lacks literature, and has no actionable interactors. Highly speculative; requires orthogonal wet-lab validation.
         * **🔴 Tier 4: Probable Artifacts (Do Not Pursue)**: Pseudogenes, lineage mismatches (e.g., breast genes in melanoma), or acronym collisions.
         
         [Discuss the genes under their appropriate Tier headers.]
@@ -566,6 +705,11 @@ def writer_node(state: AgentState):
         Then, for EVERY gene sequentially, use this exact structure:
         ## [Gene Name] ([Alteration])
         
+        ### 🎯 Target Tractability & Essentiality (OpenTargets)
+        [CRITICAL: If the OpenTargets status indicates 'ZERO tractability' or 'not found', you MUST explicitly write: "OpenTargets was queried but currently holds no tractability or essentiality data for this target."]
+        - **Druggability:** [Summarize modality buckets, or state none]
+        - **Essentiality:** [State if it is essential in DepMap screens, or state none]
+
         ### 💊 OncoKB Therapeutics
         - **Standard of Care (On-Label):** [Drug Name] (PMIDs: [List])
         - **Repurposing Opportunities (Off-Label):** [Drug Name] (PMIDs: [List])
@@ -651,10 +795,22 @@ with col1:
         update_plot_btn = st.form_submit_button("📊 Generate Volcano Plot")
 
     st.markdown("---")
-    st.subheader("3. Clinical Context & AI Triage")
+    st.subheader("4. Clinical Context & AI Triage")
     cancer_type = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value="Melanoma")
     analysis_mode = st.radio("Analysis Mode", ["Clinical Triage (Known Targets)", "Biomarker Discovery (Novel Targets)"])
-    top_n_genes = st.slider("Max Targets for AI Report", min_value=1, max_value=15, value=3)
+    
+    # --- NEW: HYBRID ROSTER UI ---
+    st.markdown("#### 🎯 Target Selection Roster")
+    st.write("Configure how many targets the AI should extract from the different biological layers:")
+    col_r1, col_r2, col_r3 = st.columns(3)
+    with col_r1:
+        n_up_pathway = st.number_input("Upregulated Pathway Drivers", min_value=0, max_value=5, value=2, help="Genes driving the dominant GSEA networks.")
+    with col_r2:
+        n_down_pathway = st.number_input("Downregulated Biomarkers", min_value=0, max_value=5, value=1, help="Suppressed genes from inverse GSEA networks (Synthetic Lethality).")
+    with col_r3:
+        n_outliers = st.number_input("Lone Wolves (Outliers)", min_value=0, max_value=5, value=1, help="Highest statistical spikes, regardless of pathway.")
+    
+    top_n_genes = n_up_pathway + n_down_pathway + n_outliers # Keep total count for downstream logic
     
     st.markdown("### 🧑‍⚕️ Clinical Safety & Evidence")
     hitl_toggle = st.toggle("⏸️ Enable Human-in-the-Loop (Review evidence before report generation)", value=True)
@@ -733,8 +889,15 @@ with col2:
         
         # Save all upregulated genes to memory for the Actionability Filter
         st.session_state.upregulated_df = plot_df[plot_df['Significance'] == 'Upregulated'].sort_values(by='padj')
+        
+        # NEW: Save the FULL results dataframe for the GSEA math engine
+        st.session_state.full_results_df = plot_df.copy()
 
         # Generate a clean map of the tumor
+        plot_title = "Gene Expression Volcano Plot"
+        if "Discovery" in analysis_mode:
+            plot_title += "<br><sup>⭐ Targets selected via Pathway-Cluster analysis (bypassing isolated statistical spikes)</sup>"
+
         fig = px.scatter(
             plot_df, x='log2FoldChange', y='-log10(padj)', color='Significance', 
             color_discrete_map={
@@ -742,7 +905,8 @@ with col2:
                 'Downregulated': '#636EFA', 'Not Significant': '#4A4A4A' 
             },
             hover_name=plot_df.index,
-            render_mode='webgl' 
+            render_mode='webgl',
+            title=plot_title  # <-- NEW: Explicitly explaining the stars!
         )
 
         # --- NEW: Changed lines to white ---
@@ -768,14 +932,11 @@ with col2:
 # ==========================================
 # EXECUTE THE AI GRAPH
 # ==========================================
-# ==========================================
-# EXECUTE THE AI GRAPH
-# ==========================================
 if run_button and counts_file and metadata_file:
     st.markdown("---")
     st.subheader("🤖 AI Clinical Report")
     
-    # --- NEW: THE ACTIONABILITY FILTER ---
+    # --- NEW: CLUSTER-FIRST TARGET SELECTION ---
     ACTIONABLE_GENES = ["BRAF", "EGFR", "KRAS", "PIK3CA", "ERBB2", "ALK", "ROS1", "MET", "RET", "NTRK1", "NTRK2", "NTRK3", "BRCA1", "BRCA2", "KIT", "PDGFRA", "FGFR1", "FGFR2", "FGFR3", "IDH1", "IDH2", "CDK4", "CDK6", "PTEN", "MTOR", "CTNNB1", "TP53"]
     
     up_df = st.session_state.get("upregulated_df", pd.DataFrame())
@@ -783,20 +944,115 @@ if run_button and counts_file and metadata_file:
         st.error("⚠️ No upregulated genes found. Please lower your P-Value or Log2FC thresholds in the Volcano Plot first.")
         st.stop()
         
-    if "Discovery" in analysis_mode:
-        # NOVEL: Filter OUT the famous genes
-        novel_df = up_df[~up_df.index.isin(ACTIONABLE_GENES)]
-        st.session_state.ai_targets = novel_df.head(top_n_genes).index.tolist()
-    else:
-        # CLINICAL: ONLY look at famous genes
-        clinical_df = up_df[up_df.index.isin(ACTIONABLE_GENES)]
-        st.session_state.ai_targets = clinical_df.head(top_n_genes).index.tolist()
+    with st.spinner("🧠 Recruiting Hybrid Target Roster via Local GSEA..."):
+        full_df = st.session_state.get("full_results_df", pd.DataFrame())
+        if full_df.empty:
+            st.error("⚠️ Full results missing. Please re-run the Volcano plot.")
+            st.stop()
+            
+        # Prepare the pools to pull from
+        if "Discovery" in analysis_mode:
+            # Filter out known actionables AND noisy Ribosomal/Mitochondrial housekeeping genes
+            gsea_input_df = full_df[
+                (~full_df.index.isin(ACTIONABLE_GENES)) & 
+                (~full_df.index.str.match(r'^(RPL|RPS|MT-)')) # <-- NEW: The Ribosome Scrubber
+            ]
+        else:
+            gsea_input_df = full_df
+            
+        up_df_pool = gsea_input_df[gsea_input_df['log2FoldChange'] > 0].sort_values(by='padj')
+        down_df_pool = gsea_input_df[gsea_input_df['log2FoldChange'] < 0].sort_values(by='padj')
+        extreme_df_pool = gsea_input_df.sort_values(by='padj') # Absolute highest significance
+
+        # Run GSEA
+        pathway_results = run_gsea_analysis(gsea_input_df)
         
-    if not st.session_state.ai_targets:
-        st.warning(f"⚠️ No targets found for {analysis_mode} mode. Try adjusting your statistical cutoffs.")
-        st.stop()
+        # --- THE FIX: Extract the complex math object to Streamlit memory, then delete it from the AI payload ---
+        st.session_state.gsea_obj = pathway_results.pop("gsea_obj", None)
         
-    st.success(f"🎯 **Target Selection Complete:** {', '.join(st.session_state.ai_targets)}")
+        cluster_targets = []
+        roster_metadata = [] # Keeps track of WHY the AI picked them
+        
+        up_pathways = [pw for pw in pathway_results.get("pathways", []) if pw.get("nes", 0) > 0]
+        down_pathways = [pw for pw in pathway_results.get("pathways", []) if pw.get("nes", 0) < 0]
+
+        # --- 1. UPREGULATED DRIVERS ---
+        up_count = 0
+        for pw in up_pathways:
+            for g in pw["overlapping_genes"]:
+                if up_count >= n_up_pathway: break
+                if g in up_df_pool.index and g not in cluster_targets:
+                    cluster_targets.append(g)
+                    roster_metadata.append({"gene": g, "source": f"Upregulated Driver ({pw['pathway']})", "alteration": "Overexpressed"})
+                    up_count += 1
+                    
+        # Pad Up Drivers if GSEA found too few
+        for g in up_df_pool.index:
+            if up_count >= n_up_pathway: break
+            if g not in cluster_targets:
+                cluster_targets.append(g)
+                roster_metadata.append({"gene": g, "source": "Upregulated Outlier (Padding)", "alteration": "Overexpressed"})
+                up_count += 1
+
+        # --- 2. DOWNREGULATED BIOMARKERS ---
+        down_count = 0
+        for pw in down_pathways:
+            for g in pw["overlapping_genes"]:
+                if down_count >= n_down_pathway: break
+                if g in down_df_pool.index and g not in cluster_targets:
+                    cluster_targets.append(g)
+                    roster_metadata.append({"gene": g, "source": f"Downregulated Biomarker ({pw['pathway']})", "alteration": "Loss of Expression"})
+                    down_count += 1
+                    
+        # Pad Down Biomarkers if GSEA found too few
+        for g in down_df_pool.index:
+            if down_count >= n_down_pathway: break
+            if g not in cluster_targets:
+                cluster_targets.append(g)
+                roster_metadata.append({"gene": g, "source": "Downregulated Outlier (Padding)", "alteration": "Loss of Expression"})
+                down_count += 1
+
+        # --- 3. LONE WOLVES (OUTLIERS) ---
+        outlier_count = 0
+        for g in extreme_df_pool.index:
+            if outlier_count >= n_outliers: break
+            if g not in cluster_targets:
+                cluster_targets.append(g)
+                direction = "Overexpressed" if full_df.loc[g, 'log2FoldChange'] > 0 else "Loss of Expression"
+                roster_metadata.append({"gene": g, "source": "Lone Wolf (Statistical Outlier)", "alteration": direction})
+                outlier_count += 1
+
+        # Save to memory
+        st.session_state.ai_targets = cluster_targets
+        st.session_state.roster_metadata = roster_metadata
+        
+        st.success(f"🧬 **Hybrid Target Roster Locked:** {', '.join(st.session_state.ai_targets)}")
+
+        # --- NEW: HIGHLIGHT TARGETS ON THE VOLCANO PLOT ---
+        full_df = st.session_state.get("full_results_df", pd.DataFrame())
+        if st.session_state.volcano_fig is not None and not full_df.empty:
+            # Safely grab only the targets that actually exist in the full dataframe
+            valid_targets = [g for g in st.session_state.ai_targets if g in full_df.index]
+            target_df = full_df.loc[valid_targets]
+            
+            for idx, row in target_df.iterrows():
+                # Dynamic color: Red for Upregulated, Blue for Downregulated
+                bg_color = "#EF553B" if row['log2FoldChange'] > 0 else "#636EFA"
+                
+                st.session_state.volcano_fig.add_annotation(
+                    x=row['log2FoldChange'],
+                    y=row['-log10(padj)'],
+                    text=f"⭐ {idx}",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1,
+                    arrowwidth=2,
+                    arrowcolor="white",
+                    font=dict(color="white", size=12, weight="bold"),
+                    bgcolor=bg_color,
+                    bordercolor="white",
+                    borderwidth=1
+                )
     
     # --- NEW: RAG PDF PROCESSING (BULLETPROOF VERSION) ---
     rag_context = ""
@@ -845,18 +1101,18 @@ if run_button and counts_file and metadata_file:
                 st.error(f"🚨 CRITICAL ERROR: Could not read the DNA file: {str(e)}")
                 st.stop()
         
-        # 2. Add RNA Overexpression Targets
-        for gene in st.session_state.ai_targets:
+        # 2. Add RNA Hybrid Roster Targets
+        for target in st.session_state.roster_metadata:
             structured_genes.append({
-                "hugo": gene,
-                "alteration": "Overexpression", 
+                "hugo": target["gene"],
+                "alteration": target["alteration"], 
                 "tumor_type": cancer_type,
-                "source": "RNA Volcanic Selection"
+                "source": target["source"] # This tells the AI if it's a Pathway Driver, Biomarker, or Lone Wolf!
             })
             
         # 3. Smart Prompt Generation (Handling both DNA and RNA)
         if "Discovery" in analysis_mode:
-            prompt_text = f"Analyze the following overexpressed genes ({', '.join(st.session_state.ai_targets)}) in {cancer_type} as potential novel biomarkers or immunotherapeutic targets."
+            prompt_text = f"Analyze the following dysregulated genes ({', '.join(st.session_state.ai_targets)}) in {cancer_type} as potential novel biomarkers or immunotherapeutic targets. Pay close attention to their directionality (Overexpressed vs. Loss of Expression)."
             if dna_gene_names:
                 prompt_text += f" Also contextualize the presence of these specific DNA mutations: {', '.join(dna_gene_names)}."
         else:
@@ -864,14 +1120,14 @@ if run_button and counts_file and metadata_file:
             if dna_gene_names:
                 prompt_text += f" CRITICAL: Prioritize finding OncoKB Level 1/2 FDA-approved therapies for the following DNA mutations: {', '.join(dna_gene_names)}."
             if st.session_state.ai_targets:
-                prompt_text += f" Secondary: Evaluate the following overexpressed targets: {', '.join(st.session_state.ai_targets)}."
+                prompt_text += f" Secondary: Evaluate the following dysregulated RNA targets: {', '.join(st.session_state.ai_targets)}. Note their directionality in your analysis."
 
         initial_state = {
             "user_prompt": prompt_text,
             "significant_genes": structured_genes,
             "plan": [],
             "gathered_evidence": [],
-            "pathway_data": {},
+            "pathway_data": pathway_results, # <-- NEW: Pass the pre-calculated cluster data!
             "final_report": "",
             "custom_knowledge": rag_context, 
             "analysis_mode": analysis_mode,
@@ -882,8 +1138,14 @@ if run_button and counts_file and metadata_file:
         
         # --- PHASE 1: GATHERING (The Executor) ---
         st.session_state.agent_state = initial_state
-        st.session_state.agent_state.update(planner_node(st.session_state.agent_state))
-        st.session_state.agent_state.update(executor_node(st.session_state.agent_state))
+        
+        with get_openai_callback() as cb:
+            st.session_state.agent_state.update(planner_node(st.session_state.agent_state))
+            st.session_state.agent_state.update(executor_node(st.session_state.agent_state))
+            
+            # Accumulate the costs
+            st.session_state.total_tokens += cb.total_tokens
+            st.session_state.total_cost += cb.total_cost
         
         st.session_state.gathering_complete = True
         st.session_state.run_complete = False # Reset in case of a re-run
@@ -975,8 +1237,13 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
             st.session_state.agent_state["discarded_evidence"] = discarded_papers
             
             # --- PHASE 2: TUMOR BOARD & WRITING ---
-            st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state)) # <-- ADD THIS
-            st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
+            with get_openai_callback() as cb:
+                st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state))
+                st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
+                
+                # Accumulate the costs
+                st.session_state.total_tokens += cb.total_tokens
+                st.session_state.total_cost += cb.total_cost
             
             # Mark as finished and refresh the page to show the results
             st.session_state.run_complete = True
@@ -1029,6 +1296,45 @@ if st.session_state.run_complete:
                 hovertemplate="<b>%{y}</b><br>Score: %{x:.2f}<br>Genes: %{text}<extra></extra>"
             )
             st.plotly_chart(pw_fig, use_container_width=True)
+            # --- NEW: GSEA MOUNTAIN PLOTS ---
+            gsea_obj = st.session_state.get("gsea_obj")
+            if gsea_obj:
+                st.markdown("### 🏔️ GSEA Enrichment Signatures")
+                st.info("These 'Mountain Plots' visualize how the math engine detected the biological shift. The barcode lines represent where the pathway genes fall across the entire tumor genome. A peak on the left means the pathway is strongly upregulated; a trough on the right means it is suppressed.")
+                
+                # Create columns for up to 3 plots side-by-side
+                plot_cols = st.columns(min(3, len(pathways)))
+                
+                for i, pw in enumerate(pathways[:3]):
+                    term = pw["pathway"]
+                    try:
+                        res_dict = gsea_obj.results[term]
+                        res_array = res_dict.get('RES') if 'RES' in res_dict else res_dict.get('res')
+                        
+                        axes = gseaplot(
+                            rank_metric=gsea_obj.ranking, 
+                            term=term,
+                            hits=res_dict['hits'],
+                            nes=res_dict['nes'],
+                            pval=res_dict['pval'],
+                            fdr=res_dict['fdr'],
+                            RES=res_array
+                        )
+                        
+                        if isinstance(axes, list):
+                            fig = axes[0].figure
+                        elif hasattr(axes, 'figure'):
+                            fig = axes.figure
+                        else:
+                            fig = plt.gcf()
+                            
+                        with plot_cols[i]:
+                            st.pyplot(fig)
+                            plt.close(fig) # <-- NEW: Clears the canvas so the next plot is pristine!
+                            
+                    except Exception as e:
+                        with plot_cols[i]:
+                            st.error(f"Failed to plot: {term}\nError: {str(e)}")
         else:
             st.info("No statistically significant pathways found for these targets.")
 
@@ -1176,3 +1482,9 @@ if st.session_state.run_complete:
                 st.markdown(response.content)
                 
         st.session_state.messages.append({"role": "assistant", "content": response.content})
+
+# --- SIDEBAR: LIVE API METRICS ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 💰 Live API Usage")
+st.sidebar.metric(label="Total Tokens Used", value=f"{st.session_state.total_tokens:,}")
+st.sidebar.metric(label="Estimated Cost (USD)", value=f"${st.session_state.total_cost:.4f}")
