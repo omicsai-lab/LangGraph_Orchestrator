@@ -16,6 +16,8 @@ from io import BytesIO
 from docx import Document
 from htmldocx import HtmlToDocx
 from typing import TypedDict, List, Dict, Any, Annotated
+import py3Dmol
+from stmol import showmol
 from pydantic import BaseModel, Field
 from inmoose.edgepy import DGEList, glmFit, glmLRT
 from patsy import dmatrix
@@ -298,7 +300,7 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interact
         if not papers: return {"status": "No abstracts available to embed."}
 
         # --- 2. SEMANTIC FILTER (FAISS VECTOR DB) ---
-        print(f"      -> Embedding {len(papers)} abstracts into FAISS for {gene} network...")
+        st.markdown(f"      -> Embedding {len(papers)} abstracts into FAISS for {gene} network...")
         docs = [LCDocument(page_content=f"Title: {p['Title']}\nAbstract: {p['Abstract']}", metadata=p) for p in papers]
         
         embeddings = OpenAIEmbeddings(api_key=openai_key)
@@ -490,6 +492,58 @@ def process_pdf_for_rag(pdf_file):
     
     return vectorstore
 
+@st.cache_data(ttl="1d", show_spinner=False)
+def get_uniprot_id(hugo_symbol):
+    """Maps a HGNC Gene Symbol to a UniProt ID using MyGene.info"""
+    url = f"https://mygene.info/v3/query?q=symbol:{hugo_symbol}&fields=uniprot&species=human"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("hits"):
+                hit = data["hits"][0]
+                uniprot = hit.get("uniprot", {})
+                if "Swiss-Prot" in uniprot:
+                    return uniprot["Swiss-Prot"]
+                elif "TrEMBL" in uniprot:
+                    return uniprot["TrEMBL"][0] if isinstance(uniprot["TrEMBL"], list) else uniprot["TrEMBL"]
+        return None
+    except Exception:
+        return None
+
+@st.cache_data(ttl="1d", show_spinner=False)
+def fetch_alphafold_structure(uniprot_id):
+    """Fetches the 3D coordinates dynamically from the AlphaFold EBI API"""
+    api_url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
+    try:
+        api_res = requests.get(api_url)
+        if api_res.status_code == 200:
+            data = api_res.json()
+            if data and isinstance(data, list):
+                file_url = data[0].get("pdbUrl")
+                file_format = "pdb"
+                if not file_url:
+                    file_url = data[0].get("cifUrl")
+                    file_format = "cif"
+                if file_url:
+                    struct_res = requests.get(file_url)
+                    if struct_res.status_code == 200:
+                        return struct_res.text, file_format
+        return None, None
+    except Exception:
+        return None, None
+
+def render_protein(structure_data, file_format="pdb", style="cartoon", color="confidence"):
+    """Configures the py3Dmol viewer"""
+    view = py3Dmol.view(width=800, height=500)
+    view.addModel(structure_data, file_format)
+    if color == "confidence":
+        view.setStyle({'model': -1}, {"cartoon": {'colorscheme': {'prop':'b','gradient': 'roygb','min':50,'max':90}}})
+    else:
+        view.setStyle({'model': -1}, {style: {'color': color}})
+    view.zoomTo()
+    return view
+
 # ==========================================
 # 3. LANGGRAPH NODES
 # ==========================================
@@ -522,18 +576,18 @@ def executor_node(state: AgentState):
         source_tag = gene_info.get("source", "Unknown Source")
         
         # NEW: Automatically fetch the biological definition first!
-        print(f"   -> Fetching biological context for {hugo}...")
+        st.markdown(f"   -> Fetching biological context for {hugo}...")
         gene_context = get_gene_info(hugo)
         
         # --- NEW: GTEX TISSUE SANITY CHECK ---
-        print(f"      -> Profiling GTEx normal tissue distribution for {hugo}...")
+        st.markdown(f"      -> Profiling GTEx normal tissue distribution for {hugo}...")
         tissue_profile = fetch_normal_tissue_profile(hugo)
         gene_context["normal_tissue_gtex"] = tissue_profile # Add it to the biology dictionary!
         
         report = {"gene": hugo, "alteration": alt, "source": source_tag, "biology": gene_context, "evidence": {}}
         
         # --- NEW: FETCH OPEN TARGETS TRACTABILITY & ESSENTIALITY ---
-        print(f"      -> Fetching Tractability & Essentiality for {hugo}...")
+        st.markdown(f"      -> Fetching Tractability & Essentiality for {hugo}...")
         report["evidence"]["OpenTargets"] = fetch_target_tractability(hugo)
         
         if "oncokb" in plan_text:
@@ -541,7 +595,7 @@ def executor_node(state: AgentState):
             
         # 1. FETCH THE NETWORK FIRST!
         if "Discovery" in state.get("analysis_mode", "Clinical Triage"):
-            print(f"      -> Fetching STRING protein network for {hugo}...")
+            st.markdown(f"      -> Fetching STRING protein network for {hugo}...")
             report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
             
         # 2. THEN FETCH PUBMED
@@ -562,7 +616,7 @@ def executor_node(state: AgentState):
             
             # --- AI RELEVANCE SCORER (OVERSAMPLE & FILTER) ---
             if pubmed_data.get("status") == "Success" and pubmed_data.get("papers"):
-                print(f"   -> Grading literature relevance for {hugo}...")
+                st.markdown(f"   -> Grading literature relevance for {hugo}...")
                 grader_llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key).with_structured_output(PaperScore)
                 
                 candidate_papers = pubmed_data["papers"]
@@ -624,7 +678,7 @@ def executor_node(state: AgentState):
             report["evidence"]["PubMed"] = pubmed_data
 
         if "clinicaltrials" in plan_text or "trials" in plan_text:
-            print(f"   -> Fetching Clinical Trials for {hugo}...")
+            st.markdown(f"   -> Fetching Clinical Trials for {hugo}...")
             report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
             
         new_evidence.append(report)
@@ -633,7 +687,7 @@ def executor_node(state: AgentState):
     return {"gathered_evidence": new_evidence, "pathway_data": state.get("pathway_data"), "ai_filtered_evidence": state.get("ai_filtered_evidence", [])}
 
 def clinical_review_node(state: AgentState):
-    print("🧑‍⚕️ [NODE: Clinical Review] Pathologist and Oncologist are debating...")
+    st.markdown("🧑‍⚕️ **[NODE: Clinical Review]** Pathologist and Oncologist are debating...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0.3, api_key=openai_key)
     
     prompt = f"""
@@ -649,7 +703,7 @@ def clinical_review_node(state: AgentState):
     return {"expert_consensus": response.content}
 
 def writer_node(state: AgentState):
-    print("✍️ [NODE: Writer] Synthesizing the final clinical report...")
+    st.markdown("✍️ [NODE: Writer] Synthesizing the final clinical report...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
     
     analysis_mode = state.get("analysis_mode", "Clinical Triage")
@@ -730,7 +784,7 @@ def writer_node(state: AgentState):
         HumanMessage(content=user_context)
     ])
     
-    print("✅ Final report successfully written.")
+    st.markdown("✅ **Final report successfully written.**")
     return {"final_report": response.content}
 
 workflow = StateGraph(AgentState)
@@ -757,7 +811,12 @@ if "ai_targets" not in st.session_state:
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    st.subheader("1. Data Upload")
+    st.subheader("1. Session Intention & Data")
+    user_intention = st.text_area(
+        "Research Goal / Intention (Optional)", 
+        placeholder="E.g., 'I am specifically looking for novel lipid metabolism targets...' or 'Focus on resistance mechanisms to BRAF inhibitors.'",
+        help="Guide the AI's literature search and synthesis. Leave blank for standard clinical triage."
+    )
     counts_file = st.file_uploader("Upload RNA Counts (CSV)", type=["csv"])
     metadata_file = st.file_uploader("Upload Metadata (CSV)", type=["csv"])
     
@@ -850,48 +909,54 @@ with col2:
             unique_levels = metadata_df[condition_col].dropna().unique()
             level_1 = unique_levels[0]
             level_2 = unique_levels[1] if len(unique_levels) > 1 else unique_levels[0]
+            
+            mock_active = st.session_state.get("use_mock_mode", False)
 
-            if de_engine == "PyDESeq2":
-                # --- Updated PyDESeq2 logic with covariates ---
-                dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors=design_factors)
-                dds.deseq2()
-                stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2])
-                stat_res.summary()
-                results_df = stat_res.results_df
-                
-            elif de_engine == "EdgePy":
-                # 1. Build the Design Matrix with optional batch effect
-                design = dmatrix(edge_formula, data=metadata_df)
-                
-                # 2. Initialize the EdgePy DGEList
-                dge_list = DGEList(counts=counts_df, samples=metadata_df, group_col=condition_col, genes=counts_df.index)
-                
-                # 3. Fit the Generalized Linear Model (GLM)
-                fit = glmFit(dge_list, design=design)
-                
-                # 4. Run the Likelihood Ratio Test (LRT) for the 'condition' variable
-                lrt = glmLRT(fit)
-                
-                # 5. Extract and format the results to match our PyDESeq2 shape
-                # InMoose outputs pandas dataframes just like PyDESeq2!
-                res = lrt.table
-                results_df = pd.DataFrame(index=res.index)
-                results_df['log2FoldChange'] = res['logFC']
-                results_df['padj'] = res['FDR'] # EdgeR uses FDR instead of padj
-
-            elif de_engine == "RPKM/T-Test":
-                # --- MOCK MODE / RPKM T-TEST PIPELINE ---
-                # Grab the mock mode toggle from the sidebar session state
-                mock_active = st.session_state.get("use_mock_mode", False)
-                output = run_differential_stats(
-                    counts_df=counts_df,
-                    metadata_df=metadata_df,
-                    condition_col=condition_col,
-                    test_cond=level_1,
-                    ctrl_cond=level_2,
-                    mock_mode=mock_active
-                )
+            # --- THE OVERRIDE ---
+            if mock_active:
+                output = run_differential_stats(counts_df, metadata_df, condition_col, level_1, level_2, mock_mode=True)
                 results_df = output["results_df"]
+            else:
+                if de_engine == "PyDESeq2":
+                    # --- Updated PyDESeq2 logic with covariates ---
+                    dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors=design_factors)
+                    dds.deseq2()
+                    stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2])
+                    stat_res.summary()
+                    results_df = stat_res.results_df
+                    
+                elif de_engine == "EdgePy":
+                    # 1. Build the Design Matrix with optional batch effect
+                    design = dmatrix(edge_formula, data=metadata_df)
+                    
+                    # 2. Initialize the EdgePy DGEList
+                    dge_list = DGEList(counts=counts_df, samples=metadata_df, group_col=condition_col, genes=counts_df.index)
+                    
+                    # 3. Fit the Generalized Linear Model (GLM)
+                    fit = glmFit(dge_list, design=design)
+                    
+                    # 4. Run the Likelihood Ratio Test (LRT) for the 'condition' variable
+                    lrt = glmLRT(fit)
+                    
+                    # 5. Extract and format the results to match our PyDESeq2 shape
+                    # InMoose outputs pandas dataframes just like PyDESeq2!
+                    res = lrt.table
+                    results_df = pd.DataFrame(index=res.index)
+                    results_df['log2FoldChange'] = res['logFC']
+                    results_df['padj'] = res['FDR'] # EdgeR uses FDR instead of padj
+
+                elif de_engine == "RPKM/T-Test":
+                    # --- PRODUCTION RPKM T-TEST PIPELINE ---
+                    # (Mock mode is handled by the override above)
+                    output = run_differential_stats(
+                        counts_df=counts_df,
+                        metadata_df=metadata_df,
+                        condition_col=condition_col,
+                        test_cond=level_1,
+                        ctrl_cond=level_2,
+                        mock_mode=False
+                    )
+                    results_df = output["results_df"]
             
         plot_df = results_df.dropna(subset=['padj', 'log2FoldChange']).copy()
         plot_df['-log10(padj)'] = -np.log10(plot_df['padj'] + 1e-300)
@@ -1088,7 +1153,7 @@ if run_button and counts_file and metadata_file:
         except Exception as e:
             st.warning(f"⚠️ PDF Database Error: {str(e)}. Proceeding using only public data.")
     
-    with st.spinner("Orchestrating AI Agents (Fetching OncoKB & PubMed)..."):
+    with st.status("🧠 Live Agent Thought Trace (Glass Box)", expanded=True) as status:
         structured_genes = []
         dna_gene_names = []
         
@@ -1127,15 +1192,21 @@ if run_button and counts_file and metadata_file:
             
         # 3. Smart Prompt Generation (Handling both DNA and RNA)
         if "Discovery" in analysis_mode:
-            prompt_text = f"Analyze the following dysregulated genes ({', '.join(st.session_state.ai_targets)}) in {cancer_type} as potential novel biomarkers or immunotherapeutic targets. Pay close attention to their directionality (Overexpressed vs. Loss of Expression)."
+            base_task = f"Analyze the following dysregulated genes ({', '.join(st.session_state.ai_targets)}) in {cancer_type} as potential novel biomarkers or immunotherapeutic targets. Pay close attention to their directionality (Overexpressed vs. Loss of Expression)."
             if dna_gene_names:
-                prompt_text += f" Also contextualize the presence of these specific DNA mutations: {', '.join(dna_gene_names)}."
+                base_task += f" Also contextualize the presence of these specific DNA mutations: {', '.join(dna_gene_names)}."
         else:
-            prompt_text = f"Find established targeted therapies for {cancer_type} patients."
+            base_task = f"Find established targeted therapies for {cancer_type} patients."
             if dna_gene_names:
-                prompt_text += f" CRITICAL: Prioritize finding OncoKB Level 1/2 FDA-approved therapies for the following DNA mutations: {', '.join(dna_gene_names)}."
+                base_task += f" CRITICAL: Prioritize finding OncoKB Level 1/2 FDA-approved therapies for the following DNA mutations: {', '.join(dna_gene_names)}."
             if st.session_state.ai_targets:
-                prompt_text += f" Secondary: Evaluate the following dysregulated RNA targets: {', '.join(st.session_state.ai_targets)}. Note their directionality in your analysis."
+                base_task += f" Secondary: Evaluate the following dysregulated RNA targets: {', '.join(st.session_state.ai_targets)}. Note their directionality in your analysis."
+
+        # Safely inject the User's Free-Text Intention without overriding the core task
+        if user_intention.strip():
+            prompt_text = f"USER'S SPECIFIC RESEARCH INTENTION: '{user_intention.strip()}'\n\nCORE SYSTEM TASK: {base_task}"
+        else:
+            prompt_text = base_task
 
         initial_state = {
             "user_prompt": prompt_text,
@@ -1220,7 +1291,7 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
         
     # --- THE FINAL TRIGGER ---
     if st.button("🚀 Step 2: Approve Evidence & Synthesize Report", type="primary", use_container_width=True):
-        with st.spinner("✍️ Synthesizing the final clinical report..."):
+        with st.markdown("✍️ **[NODE: Writer]** Synthesizing the final clinical report..."):
             approved_evidence = copy.deepcopy(st.session_state.agent_state["gathered_evidence"])
             discarded_papers = [] # <-- NEW: Temporary list for trash
             
@@ -1467,6 +1538,40 @@ if st.session_state.run_complete:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True
         )
+
+# --- ALPHAFOLD 3D VIEWER ---
+    st.markdown("---")
+    st.subheader("🧬 3D Protein Structure Viewer (AlphaFold)")
+    st.write("Visualize the predicted 3D conformation of your AI-selected targets.")
+    
+    if st.session_state.get("ai_targets"):
+        # Create a clean layout: Controls on the left, Viewer on the right
+        af_col1, af_col2 = st.columns([1, 3])
+        
+        with af_col1:
+            target_to_view = st.selectbox("Select Target:", st.session_state.ai_targets)
+            style_opts = st.selectbox("Style:", ["cartoon", "stick", "sphere"])
+            color_opts = st.selectbox("Coloring:", ["confidence", "spectrum", "blue", "red"])
+            render_btn = st.button("Fetch & Render", type="primary", use_container_width=True)
+            
+        with af_col2:
+            if render_btn:
+                with st.spinner(f"Mapping {target_to_view} to UniProt & downloading from AlphaFold..."):
+                    uniprot_id = get_uniprot_id(target_to_view)
+                    if uniprot_id:
+                        struct_string, struct_format = fetch_alphafold_structure(uniprot_id)
+                        if struct_string:
+                            st.success(f"Successfully loaded {target_to_view} (UniProt: {uniprot_id})")
+                            viewer = render_protein(struct_string, file_format=struct_format, style=style_opts, color=color_opts)
+                            showmol(viewer, height=500, width=800)
+                        else:
+                            st.error(f"Failed to download structure for {target_to_view} from AlphaFold DB.")
+                    else:
+                        st.error(f"Could not map {target_to_view} to a valid human UniProt ID.")
+            else:
+                st.info("👈 Select a target and click 'Fetch & Render' to view its 3D structure.")
+    else:
+        st.warning("No targets available to visualize.")
 
     # --- INTERACTIVE CHATBOT ---
     st.markdown("---")
