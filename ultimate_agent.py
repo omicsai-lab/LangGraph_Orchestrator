@@ -8,6 +8,12 @@ import operator
 import time
 import copy # <-- NEW: Needed for HITL evidence editing
 import xml.etree.ElementTree as ET
+import re
+import networkx as nx
+from pyvis.network import Network
+import streamlit.components.v1 as components
+import tempfile
+import os
 import markdown
 import gseapy as gp
 import matplotlib.pyplot as plt
@@ -533,16 +539,87 @@ def fetch_alphafold_structure(uniprot_id):
     except Exception:
         return None, None
 
-def render_protein(structure_data, file_format="pdb", style="cartoon", color="confidence"):
-    """Configures the py3Dmol viewer"""
+@st.cache_data(show_spinner=False)
+def get_uniprot_binding_sites(uniprot_id):
+    """Autonomously fetches known Active Sites and Ligand Binding Pockets from UniProt"""
+    url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            features = res.json().get("features", [])
+            target_residues = []
+            for f in features:
+                if f.get("type") in ["Binding site", "Active site"]:
+                    loc = f.get("location", {})
+                    start = loc.get("start", {}).get("value")
+                    end = loc.get("end", {}).get("value")
+                    if start and end: target_residues.extend(list(range(start, end + 1)))
+                    elif start: target_residues.append(start)
+            return [str(r) for r in set(target_residues)]
+        return []
+    except: return []
+
+def extract_residue_number(mutation_string):
+    """Extracts the numeric position from a string like 'V600E'"""
+    if not mutation_string: return None
+    match = re.search(r'\d+', mutation_string)
+    return match.group() if match else None
+
+def render_mutated_protein(structure_data, file_format="pdb", highlight_residues=None):
+    """Renders protein. Highlights pockets if provided, else falls back to Confidence coloring."""
     view = py3Dmol.view(width=800, height=500)
     view.addModel(structure_data, file_format)
-    if color == "confidence":
-        view.setStyle({'model': -1}, {"cartoon": {'colorscheme': {'prop':'b','gradient': 'roygb','min':50,'max':90}}})
+    
+    if highlight_residues:
+        view.setStyle({'model': -1}, {"cartoon": {'color': 'lightgrey'}})
+        if isinstance(highlight_residues, str) or isinstance(highlight_residues, int):
+            highlight_residues = [str(highlight_residues)]
+        view.addStyle({'resi': highlight_residues}, {'sphere': {'color': 'red', 'radius': 1.2}})
+        view.addStyle({'resi': highlight_residues}, {'stick': {'colorscheme': 'blueCarbon'}})
     else:
-        view.setStyle({'model': -1}, {style: {'color': color}})
+        view.setStyle({'model': -1}, {"cartoon": {'colorscheme': {'prop':'b','gradient': 'roygb','min':50,'max':90}}})
+        
     view.zoomTo()
     return view
+
+@st.cache_data(show_spinner=False)
+def fetch_visual_network(hugo_symbol, max_nodes=15):
+    """Fetches a larger interacting network specifically for the UI Graph"""
+    url = f"https://string-db.org/api/json/network?identifiers={hugo_symbol}&species=9606&limit={max_nodes}"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            return res.json()
+        return []
+    except Exception:
+        return []
+
+def build_pyvis_graph(central_gene, edges_data):
+    """Builds a physics-based interactive graph with anti-overlap repulsion"""
+    G = nx.Graph()
+    for edge in edges_data:
+        node_a = edge.get("preferredName_A")
+        node_b = edge.get("preferredName_B")
+        score = edge.get("score", 0)
+        if node_a and node_b and score > 0.4:
+            G.add_edge(node_a, node_b, weight=score)
+
+    net = Network(height="600px", width="100%", bgcolor="#0E1117", font_color="white")
+    
+    for node in G.nodes():
+        if node == central_gene:
+            net.add_node(node, label=node, color="#EF553B", size=30, shape="star")
+        else:
+            size = 15 + (G.degree(node) * 2)
+            net.add_node(node, label=node, color="#636EFA", size=size)
+
+    for edge in G.edges(data=True):
+        net.add_edge(edge[0], edge[1], value=edge[2]['weight'], color="#4A4A4A")
+
+    # --- THE PHYSICS UPGRADE ---
+    # We force 'repulsion' to keep nodes far apart so labels never overlap
+    net.repulsion(node_distance=200, central_gravity=0.1, spring_length=200, spring_strength=0.05, damping=0.09)
+    return net
 
 # ==========================================
 # 3. LANGGRAPH NODES
@@ -874,6 +951,7 @@ with col1:
     
     st.markdown("### 🧑‍⚕️ Clinical Safety & Evidence")
     hitl_toggle = st.toggle("⏸️ Enable Human-in-the-Loop (Review evidence before report generation)", value=True)
+    baseline_toggle = st.toggle("⚖️ Head-to-Head Baseline (Compare Agent vs. Vanilla LLM)", value=False)
     
     # NEW: Dynamic button text!
     if hitl_toggle:
@@ -1222,6 +1300,11 @@ if run_button and counts_file and metadata_file:
             "expert_consensus": ""
         }
         
+        # Save settings for the Vanilla Baseline execution
+        st.session_state.run_baseline = baseline_toggle
+        st.session_state.base_cancer_type = cancer_type
+        st.session_state.base_prompt = prompt_text
+        
         # --- PHASE 1: GATHERING (The Executor) ---
         st.session_state.agent_state = initial_state
         
@@ -1240,6 +1323,21 @@ if run_button and counts_file and metadata_file:
             # FREIGHT TRAIN MODE: If HITL is off, immediately run Phase 2!
             st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state)) # <-- ADD THIS
             st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
+            
+            # --- NEW: VANILLA BASELINE EXECUTION ---
+            if st.session_state.get("run_baseline"):
+                with st.status("⚖️ Generating Vanilla LLM Baseline...", expanded=True):
+                    st.markdown("Bypassing OpenTargets, OncoKB, and RAG...")
+                    vanilla_llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
+                    v_sys = "You are a clinical oncology assistant. Write a report using only your training data. Do not use tools."
+                    v_prompt = f"Task: {st.session_state.base_prompt}\nTarget Genes: {', '.join(st.session_state.ai_targets)}\nCancer: {st.session_state.base_cancer_type}"
+                    try:
+                        v_res = vanilla_llm.invoke([SystemMessage(content=v_sys), HumanMessage(content=v_prompt)])
+                        st.session_state.baseline_report = v_res.content
+                        st.markdown("✅ Vanilla Baseline complete.")
+                    except Exception as e:
+                        st.session_state.baseline_report = f"Vanilla LLM Error: {e}"
+
             st.session_state.run_complete = True
             st.session_state.final_report = st.session_state.agent_state["final_report"]
             st.session_state.plan = st.session_state.agent_state["plan"]
@@ -1327,16 +1425,30 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
                 st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state))
                 st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
                 
-                # Accumulate the costs
-                st.session_state.total_tokens += cb.total_tokens
-                st.session_state.total_cost += cb.total_cost
-            
-            # Mark as finished and refresh the page to show the results
-            st.session_state.run_complete = True
-            st.session_state.final_report = st.session_state.agent_state["final_report"]
-            st.session_state.plan = st.session_state.agent_state["plan"]
-            st.session_state.pathway_data = st.session_state.agent_state.get("pathway_data", {})
-            st.rerun()
+            # Accumulate the costs
+            st.session_state.total_tokens += cb.total_tokens
+            st.session_state.total_cost += cb.total_cost
+        
+        # --- NEW: VANILLA BASELINE EXECUTION (HITL) ---
+        if st.session_state.get("run_baseline"):
+            with st.status("⚖️ Generating Vanilla LLM Baseline...", expanded=True):
+                st.markdown("Bypassing OpenTargets, OncoKB, and RAG...")
+                vanilla_llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
+                v_sys = "You are a clinical oncology assistant. Write a report using only your training data. Do not use tools."
+                v_prompt = f"Task: {st.session_state.base_prompt}\nTarget Genes: {', '.join(st.session_state.ai_targets)}\nCancer: {st.session_state.base_cancer_type}"
+                try:
+                    v_res = vanilla_llm.invoke([SystemMessage(content=v_sys), HumanMessage(content=v_prompt)])
+                    st.session_state.baseline_report = v_res.content
+                    st.markdown("✅ Vanilla Baseline complete.")
+                except Exception as e:
+                    st.session_state.baseline_report = f"Vanilla LLM Error: {e}"
+
+        # Mark as finished and refresh the page to show the results
+        st.session_state.run_complete = True
+        st.session_state.final_report = st.session_state.agent_state["final_report"]
+        st.session_state.plan = st.session_state.agent_state["plan"]
+        st.session_state.pathway_data = st.session_state.agent_state.get("pathway_data", {})
+        st.rerun()
         
 # ==========================================
 # 5. RENDER RESULTS & CHATBOT (From Memory)
@@ -1431,9 +1543,21 @@ if st.session_state.run_complete:
             st.info("This is the internal reasoning generated by the multi-agent experts before the Medical Writer synthesized the final report.")
             st.markdown(consensus)
 
-    st.markdown("### 📄 Final Synthesized Clinical Report")
-    st.info("This report was autonomously written by the Medical Writer LLM based solely on validated tool data.")
-    st.markdown(st.session_state.final_report)
+    if st.session_state.get("baseline_report"):
+        st.markdown("### ⚖️ Head-to-Head Comparison")
+        tab1, tab2 = st.tabs(["🤖 OmicsGPT Agent (RAG + Tools)", "⚠️ Vanilla LLM Baseline (No Tools)"])
+        
+        with tab1:
+            st.info("✅ This report was autonomously written by the Medical Writer LLM based solely on validated OpenTargets, OncoKB, and PubMed RAG data.")
+            st.markdown(st.session_state.final_report)
+            
+        with tab2:
+            st.warning("🚨 **CAUTION:** This is a standard 'Vanilla' LLM output. It cannot browse the internet, query APIs, or read your custom PDF protocols. It is highly prone to hallucinating clinical trials, mechanisms of action, and outdated drug approvals. It is provided for baseline comparison only.")
+            st.markdown(st.session_state.baseline_report)
+    else:
+        st.markdown("### 📄 Final Synthesized Clinical Report")
+        st.info("✅ This report was autonomously written by the Medical Writer LLM based solely on validated tool data.")
+        st.markdown(st.session_state.final_report)
     
     # --- NEW: THE CLINICAL AUDIT TRAIL & BIBLIOGRAPHY ---
     st.markdown("### 📚 Reference Library & Evidence Audit")
@@ -1539,30 +1663,86 @@ if st.session_state.run_complete:
             use_container_width=True
         )
 
+# --- INTERACTIVE SYSTEMS BIOLOGY NETWORK ---
+    st.markdown("---")
+    st.subheader("🕸️ Interactive Protein-Protein Network")
+    st.info("""
+    **💡 Strategic Utility:** This map shows the functional neighborhood of your target. 
+    * **🔴 Red Star:** Primary target.
+    * **🔵 Blue Nodes:** Known interacting neighbors (larger nodes are highly connected "Hubs").
+    * **🎯 Clinical Strategy:** If your primary target lacks a druggable pocket in the AlphaFold viewer below, use this map to find a backdoor. Inhibiting a massive, highly connected blue Hub might successfully collapse the disease pathway.
+    """)
+    
+    if st.session_state.get("ai_targets"):
+        net_col1, net_col2 = st.columns([1, 3])
+        
+        with net_col1:
+            net_target = st.selectbox("Select Target to Map:", st.session_state.ai_targets, key="network_select")
+            render_net_btn = st.button("Generate Network", type="primary", use_container_width=True)
+            
+        with net_col2:
+            if render_net_btn:
+                with st.spinner(f"Pulling STRING network data for {net_target}..."):
+                    edges = fetch_visual_network(net_target, max_nodes=15)
+                    
+                if edges:
+                    net = build_pyvis_graph(net_target, edges)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp_file:
+                        net.save_graph(tmp_file.name)
+                        tmp_file_path = tmp_file.name
+                        
+                    with open(tmp_file_path, 'r', encoding='utf-8') as HtmlFile:
+                        components.html(HtmlFile.read(), height=650)
+                        
+                    os.remove(tmp_file_path)
+                else:
+                    st.error(f"Could not build network. STRING database lacks sufficient interaction data for {net_target}.")
+            else:
+                st.info("👈 Select a target and click 'Generate Network' to map its interactions.")
+    else:
+        st.warning("No targets available to map.")
+
 # --- ALPHAFOLD 3D VIEWER ---
     st.markdown("---")
     st.subheader("🧬 3D Protein Structure Viewer (AlphaFold)")
     st.write("Visualize the predicted 3D conformation of your AI-selected targets.")
     
     if st.session_state.get("ai_targets"):
-        # Create a clean layout: Controls on the left, Viewer on the right
         af_col1, af_col2 = st.columns([1, 3])
         
         with af_col1:
             target_to_view = st.selectbox("Select Target:", st.session_state.ai_targets)
-            style_opts = st.selectbox("Style:", ["cartoon", "stick", "sphere"])
-            color_opts = st.selectbox("Coloring:", ["confidence", "spectrum", "blue", "red"])
             render_btn = st.button("Fetch & Render", type="primary", use_container_width=True)
             
         with af_col2:
             if render_btn:
+                # 1. Check if the AI's memory knows about a DNA mutation for this gene
+                selected_gene_data = next((g for g in st.session_state.agent_state.get("significant_genes", []) if g["hugo"] == target_to_view), None)
+                
+                mutation_str = None
+                if selected_gene_data and "DNA" in selected_gene_data.get("source", ""):
+                    mutation_str = selected_gene_data.get("alteration")
+
                 with st.spinner(f"Mapping {target_to_view} to UniProt & downloading from AlphaFold..."):
                     uniprot_id = get_uniprot_id(target_to_view)
                     if uniprot_id:
                         struct_string, struct_format = fetch_alphafold_structure(uniprot_id)
                         if struct_string:
-                            st.success(f"Successfully loaded {target_to_view} (UniProt: {uniprot_id})")
-                            viewer = render_protein(struct_string, file_format=struct_format, style=style_opts, color=color_opts)
+                            residues_to_highlight = None
+                            
+                            # 2. Autonomous Decision Tree
+                            if mutation_str:
+                                residues_to_highlight = extract_residue_number(mutation_str)
+                                st.success(f"**DNA Mutation Detected:** Highlighting {mutation_str} (Residue {residues_to_highlight})")
+                            else:
+                                with st.spinner("Hunting UniProt for Active/Binding Sites..."):
+                                    residues_to_highlight = get_uniprot_binding_sites(uniprot_id)
+                                    if residues_to_highlight:
+                                        st.success(f"**RNA Target Detected:** Autonomously located {len(residues_to_highlight)} Druggable Pocket residues!")
+                                    else:
+                                        st.info("**No defined active sites found.** Displaying structural confidence map.")
+                            
+                            viewer = render_mutated_protein(struct_string, file_format=struct_format, highlight_residues=residues_to_highlight)
                             showmol(viewer, height=500, width=800)
                         else:
                             st.error(f"Failed to download structure for {target_to_view} from AlphaFold DB.")
