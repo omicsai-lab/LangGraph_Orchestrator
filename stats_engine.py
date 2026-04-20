@@ -39,17 +39,26 @@ def run_differential_stats(counts_df, metadata_df, condition_col, test_cond, ctr
     # MOCK MODE: Bypass compute and API wait times for UI Dev
     # ---------------------------------------------------------
     if mock_mode:
-        print("[System] MOCK MODE ENABLED: Bypassing compute/API bottlenecks.")
-        time.sleep(0.5)  # Simulate a brief network/compute delay
+        print("[System] MOCK MODE ENABLED: Bypassing compute/API bottlenecks. Forcing BTN1A1 and OLAH.")
+        time.sleep(0.5)  # Simulate a brief network delay
         
-        # Generate stable, dummy differential expression data
-        np.random.seed(42) # Fixed seed for stable UI testing
-        genes = counts_df.index if not counts_df.empty else [f"GENE_{i}" for i in range(1, 101)]
+        # 1. Grab original genes, or make dummies if dataframe is empty
+        genes = list(counts_df.index) if not counts_df.empty else [f"GENE_{i}" for i in range(1, 500)]
         
+        # 2. Ensure our star candidates actually exist in the list
+        if "BTN1A1" not in genes: genes.append("BTN1A1")
+        if "OLAH" not in genes: genes.append("OLAH")
+        
+        # 3. Generate background "noise" (mostly insignificant)
+        np.random.seed(42) 
         mock_results = pd.DataFrame({
-            'log2FoldChange': np.random.uniform(-4, 4, len(genes)),
-            'pvalue': np.random.uniform(0.0001, 0.1, len(genes))
+            'log2FoldChange': np.random.normal(0, 0.8, len(genes)), # Clustered around 0
+            'pvalue': np.random.uniform(0.05, 0.99, len(genes))     # Mostly insignificant
         }, index=genes)
+        
+        # 4. FORCE our candidate genes to be massive statistical outliers
+        mock_results.loc["BTN1A1", ['log2FoldChange', 'pvalue']] = [4.5, 1e-15]
+        mock_results.loc["OLAH", ['log2FoldChange', 'pvalue']] = [3.8, 1e-12]
         
         # Naive FDR correction for mock visualization
         mock_results['padj'] = mock_results['pvalue'] * 1.05 

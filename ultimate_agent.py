@@ -621,6 +621,46 @@ def build_pyvis_graph(central_gene, edges_data):
     net.repulsion(node_distance=200, central_gravity=0.1, spring_length=200, spring_strength=0.05, damping=0.09)
     return net
 
+# --- BENCH-TO-CLOUD WET LAB SCHEMAS ---
+class sgRNA(BaseModel):
+    target_exon: str = Field(description="Which exon to target (e.g., Exon 2)")
+    sequence: str = Field(description="20bp RNA sequence")
+    pam: str = Field(description="PAM sequence (e.g., NGG)")
+    off_target_risk: str = Field(description="Low, Medium, or High")
+
+class PrimerPair(BaseModel):
+    target: str = Field(description="What this primer amplifies")
+    forward: str = Field(description="Forward primer sequence (18-22bp)")
+    reverse: str = Field(description="Reverse primer sequence (18-22bp)")
+    tm: str = Field(description="Melting temperature (e.g., 60 C)")
+    amplicon_size: int = Field(description="Expected amplicon size in bp")
+
+class WetLabManifest(BaseModel):
+    rationale: str = Field(description="1-sentence explanation of why we are knocking out this gene.")
+    sgrnas: List[sgRNA] = Field(description="Top 2 sgRNA designs for CRISPR knockout.")
+    primers: List[PrimerPair] = Field(description="qPCR primers to validate the knockout.")
+
+@st.cache_data(show_spinner=False)
+def design_validation_experiment(gene_symbol, cancer_type):
+    """Autonomously designs CRISPR sgRNAs and qPCR primers."""
+    llm = ChatOpenAI(model="gpt-5.2", temperature=0.1, api_key=openai_key)
+    structured_llm = llm.with_structured_output(WetLabManifest)
+    
+    sys_msg = """You are an expert Molecular Biologist and CRISPR designer.
+    Design a realistic, immediate wet-lab validation experiment to knock out this gene using CRISPR-Cas9.
+    CRITICAL RULES:
+    1. Output strictly in the requested JSON format.
+    2. sgRNA sequences MUST be exactly 20 nucleotides + a valid PAM (e.g., CGG, TGG).
+    3. Primers MUST be 18-22 nucleotides with ~50-60% GC content.
+    4. Always include a housekeeping gene primer pair (e.g., ACTB or GAPDH) as a control."""
+    
+    prompt = f"Target Gene: {gene_symbol}\nCancer Context: {cancer_type}\nDesign the CRISPR and qPCR validation manifest."
+    try:
+        response = structured_llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=prompt)])
+        return response.model_dump() # Return as dict for Streamlit caching!
+    except Exception as e:
+        return None
+
 # ==========================================
 # 3. LANGGRAPH NODES
 # ==========================================
@@ -663,6 +703,17 @@ def executor_node(state: AgentState):
         
         report = {"gene": hugo, "alteration": alt, "source": source_tag, "biology": gene_context, "evidence": {}}
         
+        # --- NEW: UNIPROT STRUCTURAL AWARENESS ---
+        st.markdown(f"      -> Hunting UniProt for Active Sites for {hugo}...")
+        uniprot_id = get_uniprot_id(hugo)
+        if uniprot_id:
+            pockets = get_uniprot_binding_sites(uniprot_id)
+            report["evidence"]["UniProt_Pockets"] = {
+                "has_defined_pockets": len(pockets) > 0, 
+                "residue_count": len(pockets),
+                "note": "If > 0, this protein has known druggable active sites/pockets."
+            }
+            
         # --- NEW: FETCH OPEN TARGETS TRACTABILITY & ESSENTIALITY ---
         st.markdown(f"      -> Fetching Tractability & Essentiality for {hugo}...")
         report["evidence"]["OpenTargets"] = fetch_target_tractability(hugo)
@@ -790,12 +841,12 @@ def writer_node(state: AgentState):
         Write a beautiful, pathway-centric scientific report answering the user's prompt. 
         
         CRITICAL GUARDRAILS:
-        1. TONE AND STYLE: NEVER break the fourth wall. Write confidently as if you are authoring a published review article in a high-impact oncology journal. Do NOT simplify or reduce the scientific depth. Maintain maximum academic rigor, but use **bold text** for gene names and critical biological processes to guide the reader's eye through your dense prose.
+        1. TONE AND STYLE: Write confidently as if authoring a published review article in a high-impact oncology journal. NEVER break the fourth wall (do not say "The user provided" or "The AI found"). Use bullet points occasionally to break up dense mechanistic explanations. Use **bold text** for gene names.
         2. BIOLOGICAL TRIAGE: Explicitly dismiss pseudogenes and ncRNAs as non-coding artifacts.
-        3. ACRONYM COLLISIONS: Be highly aware of literature false-positives. If PubMed returns papers where the gene symbol is used as an acronym for a drug (e.g., CEL = Celastrol) or a biological process (e.g., LPO = Lipid Peroxidation), YOU MUST EXPLICITLY CALL THIS OUT as a literature mismatch. Do not treat the paper as evidence for the gene.
-        4. SYSTEMS APPROACH: Do NOT list genes one by one. Group them by their pathway and discuss them as a network.
-        5. GUILT BY ASSOCIATION: If a target lacks direct literature or trials, look at its "STRING_Interactions" data. Discuss whether targeting its direct protein neighbors might offer a backdoor therapeutic strategy.
-        6. THE SANITY CHECK: If the Expert Consensus (the Pathologist) flags that these genes belong to a different tissue lineage or represent a data mismatch, DO NOT try to invent a novel connection. Explicitly state in the Executive Summary and the Translational Outlook that the data profile appears incongruent with the stated cancer type.
+        3. ACRONYM COLLISIONS & LITERATURE LIMITATIONS: Be highly aware of literature false-positives. If PubMed returns acronym collisions or papers that only discuss network neighbors (and not the primary target), weave this critique naturally into your academic prose (e.g., "While some literature attributes X to Y, this largely reflects confounding nomenclature..." or "Current evidence is restricted to proximal network nodes rather than direct target validation..."). Do NOT use robotic sub-headers like "Sanity Check".
+        4. SYSTEMS APPROACH: Discuss genes conceptually within their pathways.
+        5. GUILT BY ASSOCIATION: If a target lacks direct literature or tractability, evaluate its "STRING_Interactions". Propose backdoor therapeutic strategies using its direct neighbors.
+        6. TISSUE CONTEXT: If the Expert Consensus flags lineage mismatches (e.g., breast genes in melanoma, or stromal admixture), state this clearly once in the executive summary, and frame the rest of the report around resolving this spatial uncertainty.
         
         REQUIRED REPORT STRUCTURE:
         ## 📊 Executive Summary
@@ -818,7 +869,7 @@ def writer_node(state: AgentState):
         [Summarize any relevant trials, or state that these novel network targets currently lack specific recruiting trials. Explicitly comment on WHY this biological connection is novel and HOW it is biologically plausible based on the Pathologist/Oncologist consensus.]
         
         ### 🧪 Recommended Next Experimental Steps
-        [Provide 3-4 bullet points on how a wet-lab researcher should experimentally validate these findings to de-risk them for clinical translation.]
+        [Provide 3-4 bullet points on how a wet-lab researcher should experimentally validate these findings. CRITICAL: Your final bullet point MUST inform the user that they can generate a ready-to-order CRISPR/qPCR Wet-Lab Manifest for any of these targets using the "Bench-to-Cloud Validation Designer" at the bottom of the dashboard.]
         """
     else:
         sys_msg = """You are an expert Clinical Oncology Medical Writer.
@@ -841,6 +892,9 @@ def writer_node(state: AgentState):
         [CRITICAL: If the OpenTargets status indicates 'ZERO tractability' or 'not found', you MUST explicitly write: "OpenTargets was queried but currently holds no tractability or essentiality data for this target."]
         - **Druggability:** [Summarize modality buckets, or state none]
         - **Essentiality:** [State if it is essential in DepMap screens, or state none]
+        - **Structural Vulnerability:** [CRITICAL: Check the 'UniProt_Pockets' data. Explicitly state if the target has defined druggable active sites/pockets, or if it lacks them.]
+
+        ### 💊 OncoKB Therapeutics
 
         ### 💊 OncoKB Therapeutics
         - **Standard of Care (On-Label):** [Drug Name] (PMIDs: [List])
@@ -1663,95 +1717,118 @@ if st.session_state.run_complete:
             use_container_width=True
         )
 
-# --- INTERACTIVE SYSTEMS BIOLOGY NETWORK ---
+# --- MULTI-MODAL VISUAL ANALYTICS DASHBOARD ---
     st.markdown("---")
-    st.subheader("🕸️ Interactive Protein-Protein Network")
-    st.info("""
-    **💡 Strategic Utility:** This map shows the functional neighborhood of your target. 
-    * **🔴 Red Star:** Primary target.
-    * **🔵 Blue Nodes:** Known interacting neighbors (larger nodes are highly connected "Hubs").
-    * **🎯 Clinical Strategy:** If your primary target lacks a druggable pocket in the AlphaFold viewer below, use this map to find a backdoor. Inhibiting a massive, highly connected blue Hub might successfully collapse the disease pathway.
-    """)
+    st.subheader("📊 Multi-Modal Target Analytics")
+    st.info("Select a target to simultaneously visualize its macroscopic biological neighborhood (Network) and its microscopic physical vulnerabilities (3D Structure).")
     
     if st.session_state.get("ai_targets"):
-        net_col1, net_col2 = st.columns([1, 3])
+        # 1. Global Target Selector
+        viz_target = st.selectbox("🎯 Select Target to Analyze:", st.session_state.ai_targets)
+        analyze_btn = st.button("Generate Dual Visualization", type="primary", use_container_width=True)
         
-        with net_col1:
-            net_target = st.selectbox("Select Target to Map:", st.session_state.ai_targets, key="network_select")
-            render_net_btn = st.button("Generate Network", type="primary", use_container_width=True)
+        if analyze_btn:
+            # 2. Side-by-Side Layout
+            col_net, col_struct = st.columns(2)
             
-        with net_col2:
-            if render_net_btn:
-                with st.spinner(f"Pulling STRING network data for {net_target}..."):
-                    edges = fetch_visual_network(net_target, max_nodes=15)
-                    
-                if edges:
-                    net = build_pyvis_graph(net_target, edges)
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp_file:
-                        net.save_graph(tmp_file.name)
-                        tmp_file_path = tmp_file.name
-                        
-                    with open(tmp_file_path, 'r', encoding='utf-8') as HtmlFile:
-                        components.html(HtmlFile.read(), height=650)
-                        
-                    os.remove(tmp_file_path)
-                else:
-                    st.error(f"Could not build network. STRING database lacks sufficient interaction data for {net_target}.")
-            else:
-                st.info("👈 Select a target and click 'Generate Network' to map its interactions.")
-    else:
-        st.warning("No targets available to map.")
-
-# --- ALPHAFOLD 3D VIEWER ---
-    st.markdown("---")
-    st.subheader("🧬 3D Protein Structure Viewer (AlphaFold)")
-    st.write("Visualize the predicted 3D conformation of your AI-selected targets.")
-    
-    if st.session_state.get("ai_targets"):
-        af_col1, af_col2 = st.columns([1, 3])
-        
-        with af_col1:
-            target_to_view = st.selectbox("Select Target:", st.session_state.ai_targets)
-            render_btn = st.button("Fetch & Render", type="primary", use_container_width=True)
+            with col_net:
+                st.markdown(f"#### 🕸️ Network Hub: {viz_target}")
+                with st.spinner("Building physics network..."):
+                    edges = fetch_visual_network(viz_target, max_nodes=15)
+                    if edges:
+                        net = build_pyvis_graph(viz_target, edges)
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp_file:
+                            net.save_graph(tmp_file.name)
+                            tmp_file_path = tmp_file.name
+                        with open(tmp_file_path, 'r', encoding='utf-8') as HtmlFile:
+                            components.html(HtmlFile.read(), height=500)
+                        os.remove(tmp_file_path)
+                    else:
+                        st.warning("Insufficient interaction data in STRING DB.")
             
-        with af_col2:
-            if render_btn:
-                # 1. Check if the AI's memory knows about a DNA mutation for this gene
-                selected_gene_data = next((g for g in st.session_state.agent_state.get("significant_genes", []) if g["hugo"] == target_to_view), None)
-                
-                mutation_str = None
-                if selected_gene_data and "DNA" in selected_gene_data.get("source", ""):
-                    mutation_str = selected_gene_data.get("alteration")
+            with col_struct:
+                st.markdown(f"#### 🧬 Structural Pockets: {viz_target}")
+                with st.spinner("Mapping 3D coordinates..."):
+                    selected_gene_data = next((g for g in st.session_state.agent_state.get("significant_genes", []) if g["hugo"] == viz_target), None)
+                    mutation_str = selected_gene_data.get("alteration") if selected_gene_data and "DNA" in selected_gene_data.get("source", "") else None
 
-                with st.spinner(f"Mapping {target_to_view} to UniProt & downloading from AlphaFold..."):
-                    uniprot_id = get_uniprot_id(target_to_view)
+                    uniprot_id = get_uniprot_id(viz_target)
                     if uniprot_id:
                         struct_string, struct_format = fetch_alphafold_structure(uniprot_id)
                         if struct_string:
                             residues_to_highlight = None
-                            
-                            # 2. Autonomous Decision Tree
                             if mutation_str:
                                 residues_to_highlight = extract_residue_number(mutation_str)
-                                st.success(f"**DNA Mutation Detected:** Highlighting {mutation_str} (Residue {residues_to_highlight})")
+                                st.caption(f"🔴 Highlighting DNA Mutation: **{mutation_str}**")
                             else:
-                                with st.spinner("Hunting UniProt for Active/Binding Sites..."):
-                                    residues_to_highlight = get_uniprot_binding_sites(uniprot_id)
-                                    if residues_to_highlight:
-                                        st.success(f"**RNA Target Detected:** Autonomously located {len(residues_to_highlight)} Druggable Pocket residues!")
-                                    else:
-                                        st.info("**No defined active sites found.** Displaying structural confidence map.")
+                                residues_to_highlight = get_uniprot_binding_sites(uniprot_id)
+                                if residues_to_highlight:
+                                    st.caption(f"🔴 Autonomously highlighted **{len(residues_to_highlight)} Active Site residues**.")
+                                else:
+                                    st.caption("🌈 No pockets found. Displaying structural confidence map.")
                             
                             viewer = render_mutated_protein(struct_string, file_format=struct_format, highlight_residues=residues_to_highlight)
                             showmol(viewer, height=500, width=800)
                         else:
-                            st.error(f"Failed to download structure for {target_to_view} from AlphaFold DB.")
+                            st.warning("Failed to download AlphaFold structure.")
                     else:
-                        st.error(f"Could not map {target_to_view} to a valid human UniProt ID.")
-            else:
-                st.info("👈 Select a target and click 'Fetch & Render' to view its 3D structure.")
+                        st.warning("Could not map to UniProt ID.")
     else:
         st.warning("No targets available to visualize.")
+
+# --- BENCH-TO-CLOUD VALIDATION DESIGNER ---
+    st.markdown("---")
+    st.subheader("🧪 Bench-to-Cloud Validation Designer")
+    st.info("Translate your in-silico findings into immediate wet-lab action. Generate hypothetical CRISPR knockout sgRNAs and qPCR primers for your selected targets.")
+    
+    if st.session_state.get("ai_targets"):
+        b2c_col1, b2c_col2 = st.columns([1, 3])
+        
+        with b2c_col1:
+            lab_target = st.selectbox("🧬 Select Target for Wet-Lab:", st.session_state.ai_targets, key="lab_select")
+            design_btn = st.button("Generate Lab Manifest", type="primary", use_container_width=True)
+            
+        with b2c_col2:
+            if design_btn:
+                with st.spinner(f"🤖 AI Molecular Biologist designing experiment for {lab_target}..."):
+                    manifest = design_validation_experiment(lab_target, cancer_type)
+                    
+                if manifest:
+                    st.success("✅ Experimental Manifest Generated!")
+                    st.markdown(f"**Rationale:** {manifest['rationale']}")
+                    
+                    st.markdown("#### ✂️ CRISPR-Cas9 sgRNA Designs")
+                    st.warning("⚠️ **Clinical Disclaimer:** These sequences are AI-generated for structural planning. You MUST verify them against the human reference genome using Benchling or IDT before ordering.")
+                    sgrna_df = pd.DataFrame(manifest['sgrnas'])
+                    st.dataframe(sgrna_df, use_container_width=True, hide_index=True)
+                    
+                    st.markdown("#### 🧬 qPCR Validation Primers")
+                    primer_df = pd.DataFrame(manifest['primers'])
+                    st.dataframe(primer_df, use_container_width=True, hide_index=True)
+                    
+                    # --- THE EXPORT IMPROVEMENT ---
+                    st.markdown("#### 📥 Export to Vendor")
+                    # Combine DataFrames for a single CSV export
+                    sgrna_export = sgrna_df.rename(columns={"target_exon": "Name", "sequence": "Sequence"})
+                    sgrna_export["Type"] = "sgRNA"
+                    primer_export = primer_df.rename(columns={"target": "Name", "forward": "Sequence"})
+                    primer_export["Type"] = "Forward Primer"
+                    primer_rev_export = primer_df.rename(columns={"target": "Name", "reverse": "Sequence"})
+                    primer_rev_export["Type"] = "Reverse Primer"
+                    
+                    export_df = pd.concat([sgrna_export[["Name", "Type", "Sequence"]], primer_export[["Name", "Type", "Sequence"]], primer_rev_export[["Name", "Type", "Sequence"]]])
+                    
+                    st.download_button(
+                        label="📄 Download IDT/GenScript Plate Manifest (.CSV)",
+                        data=export_df.to_csv(index=False).encode('utf-8'),
+                        file_name=f"{lab_target}_WetLab_Manifest.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                else:
+                    st.error("AI failed to generate a valid manifest. Please try again.")
+            else:
+                st.info("👈 Select a target and click 'Generate Lab Manifest'.")
 
     # --- INTERACTIVE CHATBOT ---
     st.markdown("---")
