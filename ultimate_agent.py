@@ -34,6 +34,7 @@ from langgraph.graph import StateGraph, START, END
 
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
+from stats_engine import run_differential_stats
 
 # ==========================================
 # PAGE CONFIGURATION & SECRETS
@@ -788,7 +789,7 @@ with col1:
     st.subheader("3. Statistical Cutoffs")
     # --- The Engine Selector and Form ---
     with st.form("stats_form"):
-        de_engine = st.selectbox("Differential Expression Engine", ["PyDESeq2", "EdgePy"])
+        de_engine = st.selectbox("Differential Expression Engine", ["PyDESeq2", "EdgePy", "RPKM/T-Test"])
         pval_thresh = st.number_input("P-Value Cutoff", min_value=0.0001, max_value=0.1000, value=0.0500, step=0.0100, format="%.4f")
         log2fc_thresh = st.slider("Log2FC Threshold (Absolute)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
         
@@ -877,6 +878,20 @@ with col2:
                 results_df = pd.DataFrame(index=res.index)
                 results_df['log2FoldChange'] = res['logFC']
                 results_df['padj'] = res['FDR'] # EdgeR uses FDR instead of padj
+
+            elif de_engine == "RPKM/T-Test":
+                # --- MOCK MODE / RPKM T-TEST PIPELINE ---
+                # Grab the mock mode toggle from the sidebar session state
+                mock_active = st.session_state.get("use_mock_mode", False)
+                output = run_differential_stats(
+                    counts_df=counts_df,
+                    metadata_df=metadata_df,
+                    condition_col=condition_col,
+                    test_cond=level_1,
+                    ctrl_cond=level_2,
+                    mock_mode=mock_active
+                )
+                results_df = output["results_df"]
             
         plot_df = results_df.dropna(subset=['padj', 'log2FoldChange']).copy()
         plot_df['-log10(padj)'] = -np.log10(plot_df['padj'] + 1e-300)
@@ -1483,8 +1498,21 @@ if st.session_state.run_complete:
                 
         st.session_state.messages.append({"role": "assistant", "content": response.content})
 
-# --- SIDEBAR: LIVE API METRICS ---
+# --- SIDEBAR: SYSTEM TELEMETRY & DEVELOPER TOOLS ---
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 💰 Live API Usage")
+st.sidebar.markdown("### ⚙️ System Telemetry")
 st.sidebar.metric(label="Total Tokens Used", value=f"{st.session_state.total_tokens:,}")
-st.sidebar.metric(label="Estimated Cost (USD)", value=f"${st.session_state.total_cost:.4f}")
+
+# Track Active Agents based on the LangGraph orchestration
+st.sidebar.metric(label="Active Agents", value="4 (Multi-Agent System)")
+
+# Explicit RAG Tracking for Transparency
+try:
+    rag_status = "Active (FAISS/PubMed/PDF)" if uploaded_pdf is not None else "Active (FAISS/PubMed)"
+except NameError:
+    rag_status = "Active (FAISS/PubMed)"
+st.sidebar.write(f"**RAG Pipeline:** {rag_status}")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🛠️ Developer Tools")
+st.sidebar.checkbox("Enable Mock Mode (Bypass APIs & Compute)", value=False, key="use_mock_mode", help="Uses deterministic dummy data for rapid UI styling.")
