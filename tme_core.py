@@ -82,7 +82,7 @@ class TMECore:
         
         # Clinical Guardrail: Require at least 2 groups for differential comparison
         if len(groups) < 2: 
-            return self.results, pd.DataFrame(columns=['Cell_Type', 'P_Value'])
+            return final_df, pd.DataFrame(columns=['Cell_Type', 'P_Value'])
 
         stats_list = []
         for cell in self.markers.keys():
@@ -92,7 +92,7 @@ class TMECore:
             g1 = final_df[final_df[risk_col] == groups[0]][cell].values
             g2 = final_df[final_df[risk_col] == groups[1]][cell].values
             
-            # Scipy Guardrail: Prevent empty arrays or zero variance from crashing nnls/mannwhitneyu
+            # Scipy Guardrail: Prevent empty arrays or zero variance from crashing
             if len(g1) == 0 or len(g2) == 0:
                 continue
                 
@@ -101,4 +101,6 @@ class TMECore:
             stats_list.append({'Cell_Type': cell, 'P_Value': p})
             
         stats_df = pd.DataFrame(stats_list) if stats_list else pd.DataFrame(columns=['Cell_Type', 'P_Value'])
-        return self.results, stats_df
+        
+        # CRITICAL FIX: Return final_df so the dashboard has the metadata columns
+        return final_df, stats_df
