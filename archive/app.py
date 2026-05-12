@@ -3,8 +3,6 @@ import pandas as pd
 import requests
 import json
 from openai import OpenAI
-from pydeseq2.dds import DeseqDataSet
-from pydeseq2.ds import DeseqStats
 
 # ==========================================
 # PAGE CONFIGURATION & SECRETS
@@ -153,6 +151,10 @@ disease_interest = st.text_input("Cancer Type / Disease Interest", value="Melano
 
 if st.button("Run Pipeline (PyDESeq2 + AI Agent)", type="primary"):
     if counts_file and metadata_file:
+        # Lazy import avoids blocking initial page render on heavy scientific imports.
+        from pydeseq2.dds import DeseqDataSet
+        from pydeseq2.ds import DeseqStats
+
         counts_df = pd.read_csv(counts_file, index_col=0)
         metadata_df = pd.read_csv(metadata_file, index_col=0)
         
