@@ -3,8 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
 import json
 import operator
 import time
@@ -82,18 +80,6 @@ except KeyError:
     st.error("⚠️ Secrets not found! Please ensure you have a .streamlit/secrets.toml file with your API keys.")
     st.stop()
 
-# --- PHASE 4: RESILIENT HTTP SESSION ---
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-http_session = requests.Session()
-http_session.mount("https://", adapter)
-http_session.mount("http://", adapter)
-
 # --- INITIALIZE SESSION STATE (MEMORY) ---
 if "run_complete" not in st.session_state:
     st.session_state.run_complete = False
@@ -129,12 +115,6 @@ if "n_down_pathway" not in st.session_state:
     st.session_state.n_down_pathway = 1
 if "n_outliers" not in st.session_state:
     st.session_state.n_outliers = 1
-if "last_cancer_type" not in st.session_state: # <-- NEW
-    st.session_state.last_cancer_type = "Melanoma"
-if "user_intention" not in st.session_state:
-    st.session_state.user_intention = ""
-if "cancer_type" not in st.session_state:
-    st.session_state.cancer_type = "Melanoma"
 
 # ==========================================
 # 1. GRAPH STATE & SCHEMAS
@@ -151,8 +131,6 @@ class AgentState(TypedDict):
     discarded_evidence: List[Dict[str, Any]] 
     ai_filtered_evidence: List[Dict[str, Any]]
     expert_consensus: str # <-- NEW: Holds the multi-agent debate
-    is_hitl_run: bool # <-- NEW: Flags if we should pause after gathering
-    user_intention: str # <-- NEW: User's explicit research goal for semantic alignment
 
 class Plan(BaseModel):
     steps: List[str] = Field(description="Step-by-step plan of tools to execute.")
@@ -170,7 +148,7 @@ def get_gene_info(hugo_symbol):
     """Fetches biological context, gene type, and aliases."""
     url = f"https://mygene.info/v3/query?q=symbol:{hugo_symbol}&fields=name,summary,type_of_gene,alias&species=human"
     try:
-        res = http_session.get(url, timeout=10)
+        res = requests.get(url)
         if res.status_code == 200:
             data = res.json()
             if data.get("hits"):
@@ -263,7 +241,7 @@ def get_onco_data(hugo, alteration, tumor_type):
     headers = {"accept": "application/json", "Authorization": f"Bearer {oncokb_key}"}
     
     try:
-        response = http_session.get(url, params=params, headers=headers, timeout=10)
+        response = requests.get(url, params=params, headers=headers)
         if response.status_code == 200:
             data = response.json()
             treatments = data.get('treatments', [])
@@ -283,7 +261,7 @@ def get_onco_data(hugo, alteration, tumor_type):
         return {"status": f"Request failed: {str(e)}"}
 
 @st.cache_data(ttl="1d", show_spinner=False)
-def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interactors=None, user_intention=""):
+def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interactors=None):
     if interactors is None: interactors = []
     
     alias_query = ""
@@ -307,7 +285,7 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interact
     search_params = {"db": "pubmed", "term": broad_query, "retmode": "json", "retmax": 40}
     
     try:
-        res = http_session.get(search_url, params=search_params, timeout=10)
+        res = requests.get(search_url, params=search_params)
         if res.status_code != 200: return {"status": f"Search Error: {res.status_code}"}
             
         id_list = res.json().get("esearchresult", {}).get("idlist", [])
@@ -317,7 +295,7 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interact
         fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
         fetch_params = {"db": "pubmed", "id": ",".join(id_list), "retmode": "xml"}
         
-        fetch_res = http_session.get(fetch_url, params=fetch_params, timeout=15)
+        fetch_res = requests.get(fetch_url, params=fetch_params)
         if fetch_res.status_code != 200: return {"status": "PubMed Fetch Error"}
             
         papers = []
@@ -346,10 +324,6 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interact
         else:
             semantic_query = f"FDA approved targeted therapy, survival outcomes, and clinical trial results for {tumor_type}."
             
-        # --- NEW: INTENT-DRIVEN RAG ALIGNMENT ---
-        if user_intention.strip():
-            semantic_query += f" Explicit focus requested on: {user_intention.strip()}."
-            
         retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
         relevant_docs = retriever.invoke(semantic_query)
         top_papers = [{"PMID": d.metadata["PMID"], "Title": d.metadata["Title"], "Abstract": d.metadata["Abstract"]} for d in relevant_docs]
@@ -374,7 +348,7 @@ def search_clinical_trials(gene, tumor_type):
     params = {"query.cond": query, "filter.overallStatus": "RECRUITING", "pageSize": 3}
     
     try:
-        res = http_session.get(url, params=params, timeout=10)
+        res = requests.get(url, params=params)
         if res.status_code == 200:
             data = res.json()
             studies = data.get("studies", [])
@@ -406,7 +380,7 @@ def get_protein_interactions(hugo_symbol):
     # 9606 is the NCBI taxonomy ID for Homo sapiens
     url = f"https://string-db.org/api/json/network?identifiers={hugo_symbol}&species=9606&limit=3"
     try:
-        res = http_session.get(url, timeout=10)
+        res = requests.get(url)
         if res.status_code == 200:
             data = res.json()
             if not data:
@@ -459,7 +433,7 @@ def fetch_target_tractability(hugo_symbol):
     """
     variables = {"queryString": hugo_symbol}
     try:
-        res = http_session.post(url, json={"query": query, "variables": variables}, timeout=10)
+        res = requests.post(url, json={"query": query, "variables": variables})
         if res.status_code == 200:
             data = res.json()
             hits = data.get("data", {}).get("search", {}).get("hits", [])
@@ -536,7 +510,7 @@ def get_uniprot_id(hugo_symbol):
     """Maps a HGNC Gene Symbol to a UniProt ID using MyGene.info"""
     url = f"https://mygene.info/v3/query?q=symbol:{hugo_symbol}&fields=uniprot&species=human"
     try:
-        res = http_session.get(url, timeout=10)
+        res = requests.get(url)
         if res.status_code == 200:
             data = res.json()
             if data.get("hits"):
@@ -555,7 +529,7 @@ def fetch_alphafold_structure(uniprot_id):
     """Fetches the 3D coordinates dynamically from the AlphaFold EBI API"""
     api_url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
     try:
-        api_res = http_session.get(api_url, timeout=10)
+        api_res = requests.get(api_url)
         if api_res.status_code == 200:
             data = api_res.json()
             if data and isinstance(data, list):
@@ -565,7 +539,7 @@ def fetch_alphafold_structure(uniprot_id):
                     file_url = data[0].get("cifUrl")
                     file_format = "cif"
                 if file_url:
-                    struct_res = http_session.get(file_url, timeout=15)
+                    struct_res = requests.get(file_url)
                     if struct_res.status_code == 200:
                         return struct_res.text, file_format
         return None, None
@@ -577,7 +551,7 @@ def get_uniprot_binding_sites(uniprot_id):
     """Autonomously fetches known Active Sites and Ligand Binding Pockets from UniProt"""
     url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json"
     try:
-        res = http_session.get(url, timeout=10)
+        res = requests.get(url)
         if res.status_code == 200:
             features = res.json().get("features", [])
             target_residues = []
@@ -620,7 +594,7 @@ def fetch_visual_network(hugo_symbol, max_nodes=15):
     """Fetches a larger interacting network specifically for the UI Graph"""
     url = f"https://string-db.org/api/json/network?identifiers={hugo_symbol}&species=9606&limit={max_nodes}"
     try:
-        res = http_session.get(url, timeout=10)
+        res = requests.get(url)
         if res.status_code == 200:
             return res.json()
         return []
@@ -719,164 +693,133 @@ def executor_node(state: AgentState):
     genes = state.get("significant_genes", [])
     new_evidence = []
     
-    # COPY the discarded evidence list to prevent mutating the graph state dictionary directly!
-    ai_filtered_evidence_list = state.get("ai_filtered_evidence", []).copy()
-    
     for gene_info in genes:
         hugo = gene_info.get("hugo")
         alt = gene_info.get("alteration")
         tumor_type = gene_info.get("tumor_type")
         source_tag = gene_info.get("source", "Unknown Source")
         
-        report = {"gene": hugo, "alteration": alt, "source": source_tag, "biology": {}, "evidence": {}}
+        # NEW: Automatically fetch the biological definition first!
+        st.markdown(f"   -> Fetching biological context for {hugo}...")
+        gene_context = get_gene_info(hugo)
         
-        # --- 1. BIOLOGICAL CONTEXT GATE ---
-        try:
-            st.markdown(f"   -> Fetching biological context for {hugo}...")
-            gene_context = get_gene_info(hugo)
-        except Exception as e:
-            gene_context = {"name": "Unknown", "type": "Unknown", "summary": "API Unavailable.", "aliases": ""}
-            
-        report["biology"] = gene_context
+        # --- NEW: GTEX TISSUE SANITY CHECK ---
+        st.markdown(f"      -> Profiling GTEx normal tissue distribution for {hugo}...")
+        tissue_profile = fetch_normal_tissue_profile(hugo)
+        gene_context["normal_tissue_gtex"] = tissue_profile # Add it to the biology dictionary!
         
-        # --- 2. GTEX TISSUE GATE ---
-        try:
-            st.markdown(f"      -> Profiling GTEx normal tissue distribution for {hugo}...")
-            tissue_profile = fetch_normal_tissue_profile(hugo)
-            report["biology"]["normal_tissue_gtex"] = tissue_profile
-        except Exception as e:
-            report["biology"]["normal_tissue_gtex"] = "GTEx proxy unavailable."
-            
-        # --- 3. UNIPROT STRUCTURAL GATE ---
-        try:
-            st.markdown(f"      -> Hunting UniProt for Active Sites for {hugo}...")
-            uniprot_id = get_uniprot_id(hugo)
-            if uniprot_id:
-                pockets = get_uniprot_binding_sites(uniprot_id)
-                report["evidence"]["UniProt_Pockets"] = {
-                    "has_defined_pockets": len(pockets) > 0, 
-                    "residue_count": len(pockets),
-                    "note": "If > 0, this protein has known druggable active sites/pockets."
-                }
-        except Exception as e:
-            report["evidence"]["UniProt_Pockets"] = {"status": f"Database Connection Unavailable: {str(e)}"}
-            
-        # --- 4. OPEN TARGETS GATE ---
-        try:
-            st.markdown(f"      -> Fetching Tractability & Essentiality for {hugo}...")
-            report["evidence"]["OpenTargets"] = fetch_target_tractability(hugo)
-        except Exception as e:
-            report["evidence"]["OpenTargets"] = {"status": f"Database Connection Unavailable: {str(e)}"}
+        report = {"gene": hugo, "alteration": alt, "source": source_tag, "biology": gene_context, "evidence": {}}
         
-        # --- 5. ONCOKB GATE ---
+        # --- NEW: UNIPROT STRUCTURAL AWARENESS ---
+        st.markdown(f"      -> Hunting UniProt for Active Sites for {hugo}...")
+        uniprot_id = get_uniprot_id(hugo)
+        if uniprot_id:
+            pockets = get_uniprot_binding_sites(uniprot_id)
+            report["evidence"]["UniProt_Pockets"] = {
+                "has_defined_pockets": len(pockets) > 0, 
+                "residue_count": len(pockets),
+                "note": "If > 0, this protein has known druggable active sites/pockets."
+            }
+            
+        # --- NEW: FETCH OPEN TARGETS TRACTABILITY & ESSENTIALITY ---
+        st.markdown(f"      -> Fetching Tractability & Essentiality for {hugo}...")
+        report["evidence"]["OpenTargets"] = fetch_target_tractability(hugo)
+        
         if "oncokb" in plan_text:
-            try:
-                report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
-            except Exception as e:
-                report["evidence"]["OncoKB"] = {"status": f"Database Connection Unavailable: {str(e)}"}
+            report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
             
-        # --- 6. STRING NETWORK GATE ---
+        # 1. FETCH THE NETWORK FIRST!
         if "Discovery" in state.get("analysis_mode", "Clinical Triage"):
-            try:
-                st.markdown(f"      -> Fetching STRING protein network for {hugo}...")
-                report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
-            except Exception as e:
-                report["evidence"]["STRING_Interactions"] = {"status": f"Database Connection Unavailable: {str(e)}"}
+            st.markdown(f"      -> Fetching STRING protein network for {hugo}...")
+            report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
             
-        # --- 7. PUBMED & AI TRIAGE GATE ---
+        # 2. THEN FETCH PUBMED
         if "pubmed" in plan_text:
-            try:
-                # EXTRACT THE NETWORK WE JUST FETCHED (safe defaults if network fetching failed)
-                interactors = report.get("evidence", {}).get("STRING_Interactions", {}).get("interacting_proteins", [])
+            # EXTRACT THE NETWORK WE JUST FETCHED!
+            interactors = report.get("evidence", {}).get("STRING_Interactions", {}).get("interacting_proteins", [])
+            
+            pubmed_data = search_pubmed(
+                hugo, 
+                tumor_type, 
+                mode=state.get("analysis_mode", "Clinical Triage"),
+                aliases=gene_context.get("aliases", ""),
+                interactors=interactors # <-- Pass the network into the tool!
+            )
+            
+            # NEW: Save the Semantic Search Provenance Log!
+            report["evidence"]["PubMed_Provenance"] = pubmed_data.get("provenance", [])
+            
+            # --- AI RELEVANCE SCORER (OVERSAMPLE & FILTER) ---
+            if pubmed_data.get("status") == "Success" and pubmed_data.get("papers"):
+                st.markdown(f"   -> Grading literature relevance for {hugo}...")
+                grader_llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key).with_structured_output(PaperScore)
                 
-                pubmed_data = search_pubmed(
-                    hugo, 
-                    tumor_type, 
-                    mode=state.get("analysis_mode", "Clinical Triage"),
-                    aliases=gene_context.get("aliases", ""),
-                    interactors=interactors, # <-- Pass the network into the tool!
-                    user_intention=state.get("user_intention", "") # <-- NEW: Pass intent to semantic search
-                )
+                candidate_papers = pubmed_data["papers"]
+                good_papers = []
                 
-                # Save the Semantic Search Provenance Log!
-                report["evidence"]["PubMed_Provenance"] = pubmed_data.get("provenance", [])
+                bio_name = gene_context.get('name', 'Unknown')
+                bio_summary = gene_context.get('summary', 'No summary available.')
                 
-                # --- AI RELEVANCE SCORER (OVERSAMPLE & FILTER) ---
-                if pubmed_data.get("status") == "Success" and pubmed_data.get("papers"):
-                    st.markdown(f"   -> Grading literature relevance for {hugo}...")
-                    grader_llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key).with_structured_output(PaperScore)
+                for p in candidate_papers:
+                    if len(good_papers) >= 3:
+                        break # We found 3 good papers! Stop grading to save OpenAI tokens.
+                        
+                    # NEW: Tell the scorer to accept network interactions!
+                    network_str = f" OR its immediate functional network ({', '.join(interactors)})" if interactors else ""
                     
-                    candidate_papers = pubmed_data["papers"]
-                    good_papers = []
+                    eval_prompt = f"""
+                    Evaluate this abstract's relevance to the target {hugo} ({bio_name}){network_str} in {tumor_type}.
+                    Biological Function of {hugo}: {bio_summary}
                     
-                    bio_name = gene_context.get('name', 'Unknown')
-                    bio_summary = gene_context.get('summary', 'No summary available.')
+                    CRITICAL RUBRIC:
+                    - Score 1-4: Acronym collision (e.g., the gene symbol refers to a drug/procedure), completely unrelated disease, or irrelevant biology.
+                    - Score 5-10: Relevant. The primary gene {hugo} {network_str} is mentioned in a functional, prognostic, or therapeutic context. (Score highly if it validates the target's network!).
                     
-                    for p in candidate_papers:
-                        if len(good_papers) >= 3:
-                            break # We found 3 good papers! Stop grading to save OpenAI tokens.
+                    Title: {p['Title']}
+                    Abstract: {p['Abstract'][:800]}
+                    """
+                    
+                    try:
+                        score_result = grader_llm.invoke([
+                            SystemMessage(content="You are an expert oncology peer-reviewer. Output strict JSON grading the paper's relevance."),
+                            HumanMessage(content=eval_prompt)
+                        ])
+                        p["AI_Score"] = score_result.score
+                        p["AI_Reason"] = score_result.reason
+                        
+                        if score_result.score >= 5:
+                            good_papers.append(p)
+                        else:
+                            # Toss it into the AI's trash can!
+                            ai_filtered_evidence = state.get("ai_filtered_evidence", [])
+                            ai_filtered_evidence.append({
+                                "Gene": hugo,
+                                "Score": score_result.score,
+                                "Reason": score_result.reason,
+                                "Title": p["Title"],
+                                "PMID": p["PMID"]
+                            })
+                            state["ai_filtered_evidence"] = ai_filtered_evidence
                             
-                        # Tell the scorer to accept network interactions!
-                        network_str = f" OR its immediate functional network ({', '.join(interactors)})" if interactors else ""
+                    except Exception as e:
+                        print(f"Scoring failed for {hugo}: {e}")
+                        p["AI_Score"] = "?"
+                        p["AI_Reason"] = "Error"
+                        good_papers.append(p) # Keep it if scoring fails just to be safe
+                
+                # Replace the massive list of 10 papers with ONLY the good ones
+                pubmed_data["papers"] = good_papers
                         
-                        eval_prompt = f"""
-                        Evaluate this abstract's relevance to the target {hugo} ({bio_name}){network_str} in {tumor_type}.
-                        Biological Function of {hugo}: {bio_summary}
-                        
-                        CRITICAL RUBRIC:
-                        - Score 1-4: Acronym collision (e.g., the gene symbol refers to a drug/procedure), completely unrelated disease, or irrelevant biology.
-                        - Score 5-10: Relevant. The primary gene {hugo} {network_str} is mentioned in a functional, prognostic, or therapeutic context. (Score highly if it validates the target's network!).
-                        
-                        Title: {p['Title']}
-                        Abstract: {p['Abstract'][:800]}
-                        """
-                        
-                        try:
-                            score_result = grader_llm.invoke([
-                                SystemMessage(content="You are an expert oncology peer-reviewer. Output strict JSON grading the paper's relevance."),
-                                HumanMessage(content=eval_prompt)
-                            ])
-                            p["AI_Score"] = score_result.score
-                            p["AI_Reason"] = score_result.reason
-                            
-                            if score_result.score >= 5:
-                                good_papers.append(p)
-                            else:
-                                # Toss it into the AI's trash can!
-                                ai_filtered_evidence_list.append({
-                                    "Gene": hugo,
-                                    "Score": score_result.score,
-                                    "Reason": score_result.reason,
-                                    "Title": p["Title"],
-                                    "PMID": p["PMID"]
-                                })
-                                
-                        except Exception as e:
-                            print(f"Scoring failed for {hugo}: {e}")
-                            p["AI_Score"] = "?"
-                            p["AI_Reason"] = "Error"
-                            good_papers.append(p) # Keep it if scoring fails just to be safe
-                    
-                    # Replace the massive list of 10 papers with ONLY the good ones
-                    pubmed_data["papers"] = good_papers
-                            
-                report["evidence"]["PubMed"] = pubmed_data
-            except Exception as e:
-                report["evidence"]["PubMed"] = {"status": f"Database Connection Unavailable: {str(e)}"}
-                report["evidence"]["PubMed_Provenance"] = ["PubMed API or Semantic Embedding Pipeline Failed."]
+            report["evidence"]["PubMed"] = pubmed_data
 
-        # --- 8. CLINICAL TRIALS GATE ---
         if "clinicaltrials" in plan_text or "trials" in plan_text:
-            try:
-                st.markdown(f"   -> Fetching Clinical Trials for {hugo}...")
-                report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
-            except Exception as e:
-                report["evidence"]["ClinicalTrials"] = {"status": f"Database Connection Unavailable: {str(e)}"}
+            st.markdown(f"   -> Fetching Clinical Trials for {hugo}...")
+            report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
             
         new_evidence.append(report)
-        time.sleep(1.5) # <-- Prevents local script flooding, network throttling handled by adapter
+        time.sleep(1.5) # <-- NEW: Prevent OpenTargets/PubMed API rate-limiting!
         
-    return {"gathered_evidence": new_evidence, "ai_filtered_evidence": ai_filtered_evidence_list}
+    return {"gathered_evidence": new_evidence, "pathway_data": state.get("pathway_data"), "ai_filtered_evidence": state.get("ai_filtered_evidence", [])}
 
 def clinical_review_node(state: AgentState):
     st.markdown("🧑‍⚕️ **[NODE: Clinical Review]** Pathologist and Oncologist are debating...")
@@ -887,8 +830,8 @@ def clinical_review_node(state: AgentState):
     Clean Evidence: {json.dumps(state.get('gathered_evidence'))}
     Pathways: {json.dumps(state.get('pathway_data'))}
     
-    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context and biological plausibility. CRITICAL SANITY CHECK: You MUST explicitly compare the gene's "normal_tissue_gtex" profile (found in the Clean Evidence) against the user's specified Cancer Type. If the gene is a canonical marker for a completely different tissue type (e.g., a pancreas gene in a melanoma sample), you MUST flag this as a probable lineage artifact or sample contamination. Furthermore, if the user prompt mentions "CAR-T", "CAR", "antibody", "ADC", or "surface", explicitly audit the OpenTargets tractability and biological summary to determine sub-cellular localization. State clearly whether the target is a transmembrane/surface-bound receptor or an intracellular/nuclear factor.
-    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability and clinical trial viability. You MUST explicitly reference the OpenTargets Tractability and DepMap Essentiality data provided in the Clean Evidence to justify your assessment. If the Pathologist flags a tissue mismatch, advise extreme caution regarding clinical utility. Additionally, if the Pathologist determines the target is intracellular but the user proposed a surface-modality (like CAR-T or ADC), you MUST issue a strict warning invalidating the target for that specific modality.
+    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context and biological plausibility. CRITICAL SANITY CHECK: You MUST explicitly compare the gene's "normal_tissue_gtex" profile (found in the Clean Evidence) against the user's specified Cancer Type. If the gene is a canonical marker for a completely different tissue type (e.g., a pancreas gene in a melanoma sample), you MUST flag this as a probable lineage artifact or sample contamination.
+    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability and clinical trial viability. You MUST explicitly reference the OpenTargets Tractability and DepMap Essentiality data provided in the Clean Evidence to justify your assessment. If the Pathologist flags a tissue mismatch, advise extreme caution regarding clinical utility.
     Third, speak as a BIOINFORMATICS AUDITOR: In 1 paragraph, audit the PubMed literature for Acronym Collisions. (e.g., if the gene symbol is 'CEL' but the abstract is talking about 'CEL cells' or 'Celastrol', or 'PPL' meaning a polymer). If you detect a collision or biologically disconnected paper, explicitly name it and command the Medical Writer to ignore it.
     """
     response = llm.invoke([HumanMessage(content=prompt)])
@@ -982,33 +925,16 @@ def writer_node(state: AgentState):
     st.markdown("✅ **Final report successfully written.**")
     return {"final_report": response.content}
 
-def route_start(state: AgentState):
-    """Routes to Phase 2 if evidence already exists, else starts Phase 1."""
-    # FIX: Rely on 'plan' existence AND the 'is_hitl_run' un-pause flag to know we are in Phase 2
-    # This prevents infinite loops if the user threw ALL papers in the trash!
-    if state.get("plan") and len(state.get("plan")) > 0 and not state.get("is_hitl_run", True):
-        return "clinical_review"
-    return "planner"
-
-def route_executor(state: AgentState):
-    """Pauses the graph if HITL is enabled; otherwise continues to clinical review."""
-    if state.get("is_hitl_run", False):
-        return END
-    return "clinical_review"
-
 workflow = StateGraph(AgentState)
 workflow.add_node("planner", planner_node)
 workflow.add_node("executor", executor_node)
 workflow.add_node("clinical_review", clinical_review_node) # <-- NEW
 workflow.add_node("writer", writer_node)
 
-# --- NEW: CONDITIONAL ROUTING EDGES ---
-workflow.add_conditional_edges(START, route_start)
+workflow.add_edge(START, "planner")
 workflow.add_edge("planner", "executor")
-workflow.add_conditional_edges("executor", route_executor)
-workflow.add_edge("clinical_review", "writer")
-workflow.add_edge("writer", END)
-
+# We remove the direct edge from executor to writer, because Streamlit HITL handles the pause!
+# The graph just holds the nodes. We call them manually in Streamlit.
 orchestrator = workflow.compile()
 
 # ==========================================
@@ -1018,7 +944,12 @@ orchestrator = workflow.compile()
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    st.subheader("1. Session Data")
+    st.subheader("1. Session Intention & Data")
+    user_intention = st.text_area(
+        "Research Goal / Intention (Optional)", 
+        placeholder="E.g., 'I am specifically looking for novel lipid metabolism targets...' or 'Focus on resistance mechanisms to BRAF inhibitors.'",
+        help="Guide the AI's literature search and synthesis. Leave blank for standard clinical triage."
+    )
     counts_file = st.file_uploader("Upload RNA Counts (CSV)", type=["csv"])
     metadata_file = st.file_uploader("Upload Metadata (CSV)", type=["csv"])
     
@@ -1051,15 +982,6 @@ with col1:
     
     # --- Unified Configuration Form ---
     with st.form(key="target_settings_form"):
-        st.markdown("#### 📝 Research Context")
-        user_intention_input = st.text_area(
-            "Research Goal / Intention (Optional)", 
-            value=st.session_state.user_intention,
-            placeholder="E.g., 'I am specifically looking for novel lipid metabolism targets...' or 'Focus on resistance mechanisms to BRAF inhibitors.'",
-            help="Guide the AI's literature search and synthesis. Leave blank for standard clinical triage."
-        )
-        cancer_type_input = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value=st.session_state.cancer_type)
-        
         st.markdown("#### 📈 Statistical Cutoffs")
         de_engine_input = st.selectbox("Differential Expression Engine", ["PyDESeq2", "RPKM/T-Test"], index=0 if st.session_state.de_engine == "PyDESeq2" else 1)
         pval_thresh_input = st.number_input("P-Value Cutoff", min_value=0.0001, max_value=0.1000, value=st.session_state.pval_thresh, step=0.0100, format="%.4f")
@@ -1079,20 +1001,7 @@ with col1:
         submitted = st.form_submit_button("Apply Configuration & Generate Plot")
         
     if submitted:
-        # --- PHASE 4 FIX: STALE CONTEXT RESET ---
-        # Moving this inside the form submission guarantees we only purge state when actively applying a new context!
-        if st.session_state.last_cancer_type != cancer_type_input:
-            st.session_state.upregulated_df = pd.DataFrame()
-            st.session_state.full_results_df = pd.DataFrame()
-            st.session_state.ai_targets = []
-            st.session_state.gathering_complete = False
-            st.session_state.run_complete = False
-            st.session_state.agent_state = {}
-            st.session_state.last_cancer_type = cancer_type_input
-            
         # Explicitly bind mutated values to state ONLY when form is submitted to prevent race conditions
-        st.session_state.user_intention = user_intention_input
-        st.session_state.cancer_type = cancer_type_input
         st.session_state.de_engine = de_engine_input
         st.session_state.pval_thresh = pval_thresh_input
         st.session_state.log2fc_thresh = log2fc_thresh_input
@@ -1101,8 +1010,6 @@ with col1:
         st.session_state.n_outliers = n_out_input
         
     # Extract from state for safe downstream usage (retained during unrelated UI rerenders)
-    user_intention = st.session_state.user_intention
-    cancer_type = st.session_state.cancer_type
     de_engine = st.session_state.de_engine
     pval_thresh = st.session_state.pval_thresh
     log2fc_thresh = st.session_state.log2fc_thresh
@@ -1115,7 +1022,7 @@ with col1:
 
     st.markdown("---")
     st.subheader("4. Clinical Context & AI Triage")
-    
+    cancer_type = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value="Melanoma")
     analysis_mode = st.radio("Analysis Mode", ["Clinical Triage (Known Targets)", "Biomarker Discovery (Novel Targets)"])
     
     st.markdown("### 🧑‍⚕️ Clinical Safety & Evidence")
@@ -1502,9 +1409,7 @@ if run_button and counts_file and metadata_file:
             "analysis_mode": analysis_mode,
             "discarded_evidence": [], 
             "ai_filtered_evidence": [],
-            "expert_consensus": "",
-            "is_hitl_run": hitl_toggle, # <-- NEW: Inject HITL context for graph router!
-            "user_intention": st.session_state.get("user_intention", "") # <-- NEW: Inject intent for FAISS search
+            "expert_consensus": ""
         }
         
         # Save settings for the Vanilla Baseline execution
@@ -1513,16 +1418,11 @@ if run_button and counts_file and metadata_file:
         st.session_state.base_prompt = prompt_text
         
         # --- PHASE 1: GATHERING (The Executor) ---
+        st.session_state.agent_state = initial_state
+        
         with get_openai_callback() as cb:
-            if hitl_toggle:
-                # 🤖 TRUE AGENTIC INVOCATION (Phase 1 Only)
-                final_output_state = orchestrator.invoke(initial_state)
-            else:
-                # 🤖 TRUE AGENTIC INVOCATION (Freight Train Full Pipeline)
-                final_output_state = orchestrator.invoke(initial_state)
-                
-            # Securely unpack the returned final graph state back into Streamlit memory
-            st.session_state.agent_state = final_output_state
+            st.session_state.agent_state.update(planner_node(st.session_state.agent_state))
+            st.session_state.agent_state.update(executor_node(st.session_state.agent_state))
             
             # Accumulate the costs
             st.session_state.total_tokens += cb.total_tokens
@@ -1532,6 +1432,10 @@ if run_button and counts_file and metadata_file:
         st.session_state.run_complete = False # Reset in case of a re-run
         
         if not hitl_toggle:
+            # FREIGHT TRAIN MODE: If HITL is off, immediately run Phase 2!
+            st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state)) # <-- ADD THIS
+            st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
+            
             # --- NEW: VANILLA BASELINE EXECUTION ---
             if st.session_state.get("run_baseline"):
                 with st.status("⚖️ Generating Vanilla LLM Baseline...", expanded=True):
@@ -1547,9 +1451,8 @@ if run_button and counts_file and metadata_file:
                         st.session_state.baseline_report = f"Vanilla LLM Error: {e}"
 
             st.session_state.run_complete = True
-            # FIX: Use safe .get() unpacking to prevent KeyError if generation fails
-            st.session_state.final_report = st.session_state.agent_state.get("final_report", "⚠️ Report generation failed.")
-            st.session_state.plan = st.session_state.agent_state.get("plan", [])
+            st.session_state.final_report = st.session_state.agent_state["final_report"]
+            st.session_state.plan = st.session_state.agent_state["plan"]
             st.session_state.pathway_data = st.session_state.agent_state.get("pathway_data", {})
             
         st.rerun() # NEW: Forces Streamlit to cleanly switch to the Pause menu!
@@ -1610,7 +1513,6 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
                 
                 # Loop through the table to sort checked vs unchecked
                 for i, row in edited_df.iterrows():
-                    # RE-ADDED: Safely unpack the pointers to the original data payload
                     g_idx = flat_papers[i]["_g_idx"]
                     p_idx = flat_papers[i]["_p_idx"]
                     original_paper = st.session_state.agent_state["gathered_evidence"][g_idx]["evidence"]["PubMed"]["papers"][p_idx]
@@ -1625,20 +1527,15 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
                             "Title": original_paper.get("Title", "Unknown Title"),
                             "PMID": original_paper.get("PMID", "Unknown PMID")
                         })
-                            
+                        
             # Save the clean evidence AND the trash back to the AI's brain
-            current_state = st.session_state.agent_state
-            current_state["gathered_evidence"] = approved_evidence
-            current_state["discarded_evidence"] = discarded_papers
-            current_state["is_hitl_run"] = False # <-- NEW: Un-pause for Phase 2 synthesis!
+            st.session_state.agent_state["gathered_evidence"] = approved_evidence
+            st.session_state.agent_state["discarded_evidence"] = discarded_papers
             
             # --- PHASE 2: TUMOR BOARD & WRITING ---
             with get_openai_callback() as cb:
-                # 🤖 TRUE AGENTIC INVOCATION (Phase 2 Only)
-                final_output_state = orchestrator.invoke(current_state)
-                
-                # Unpack the state cleanly back into Streamlit memory
-                st.session_state.agent_state = final_output_state
+                st.session_state.agent_state.update(clinical_review_node(st.session_state.agent_state))
+                st.session_state.agent_state.update(writer_node(st.session_state.agent_state))
                 
             # Accumulate the costs
             st.session_state.total_tokens += cb.total_tokens
@@ -1660,9 +1557,8 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
 
         # Mark as finished and refresh the page to show the results
         st.session_state.run_complete = True
-        # FIX: Use safe .get() unpacking
-        st.session_state.final_report = st.session_state.agent_state.get("final_report", "⚠️ Report generation failed.")
-        st.session_state.plan = st.session_state.agent_state.get("plan", [])
+        st.session_state.final_report = st.session_state.agent_state["final_report"]
+        st.session_state.plan = st.session_state.agent_state["plan"]
         st.session_state.pathway_data = st.session_state.agent_state.get("pathway_data", {})
         st.rerun()
         
