@@ -1,69 +1,47 @@
-# ==========================================
-# 🛡️ ONCOLOGY AGENT: PRISTINE IMPORT BLOCK
-# ==========================================
-
-# --- 1. CORE UI & SYSTEM ---
 import streamlit as st
-import streamlit.components.v1 as components
-import os
-import time
-import json
-import re
-import operator  # <--- ADD THIS LINE
-import tempfile
-import io
-from io import BytesIO
-import requests
-import markdown
-import copy
-from typing import TypedDict, List, Dict, Any, Annotated
-from pydantic import BaseModel, Field
-
-# --- 2. DATA SCIENCE & MATH ---
 import pandas as pd
 import numpy as np
+import plotly.express as px
+import requests
+import json
+import operator
+import time
+import copy # <-- NEW: Needed for HITL evidence editing
+import xml.etree.ElementTree as ET
+import re
 import networkx as nx
-from scipy.stats import pearsonr
-from scipy.optimize import nnls
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import NuSVR
-import plotly.express as px
-from tme_core import TMECore
-
-# --- 3. GENOMICS & BIOINFORMATICS ---
-import anndata as ad
-import scanpy as sc  # Added for future-proofing your Census work
-import gseapy as gp
-from gseapy.plot import gseaplot
-from pydeseq2.dds import DeseqDataSet
-from pydeseq2.ds import DeseqStats
-
-# --- 4. VISUALIZATION ---
-import plotly.express as px
-import matplotlib.pyplot as plt
 from pyvis.network import Network
-import py3Dmol
-from stmol import showmol
-
-# --- 5. REPORT GENERATION ---
+import streamlit.components.v1 as components
+import tempfile
+import os
+import markdown
+import gseapy as gp
+import matplotlib.pyplot as plt
+from gseapy.plot import gseaplot
+from io import BytesIO
 from docx import Document
 from htmldocx import HtmlToDocx
-from PyPDF2 import PdfReader
-
-# --- 6. AI BRAIN & RAG (LANGCHAIN/LANGGRAPH) ---
-from openai import OpenAI
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_core.documents import Document as LCDocument
+from typing import TypedDict, List, Dict, Any, Annotated
+import py3Dmol
+from stmol import showmol
+from pydantic import BaseModel, Field
+from patsy import dmatrix
+# --- NEW RAG IMPORTS ---
+from langchain_core.documents import Document as LCDocument # <-- ALIAS FIX
 from langchain_community.callbacks import get_openai_callback
-from langchain_community.vectorstores import FAISS
+from PyPDF2 import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+
+from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 
-# --- 7. LOCAL MODULES ---
-# Ensure stats_engine.py is in your folder!
-from stats_engine import run_differential_stats 
+from pydeseq2.dds import DeseqDataSet
+from pydeseq2.ds import DeseqStats
+from stats_engine import run_differential_stats
 
 # ==========================================
 # PAGE CONFIGURATION & SECRETS
@@ -116,6 +94,28 @@ if "total_tokens" not in st.session_state:
 if "total_cost" not in st.session_state:
     st.session_state.total_cost = 0.0
 
+# --- NEW: GLOBAL STATE INITIALIZATION ---
+if "upregulated_df" not in st.session_state:
+    st.session_state.upregulated_df = pd.DataFrame()
+if "full_results_df" not in st.session_state:
+    st.session_state.full_results_df = pd.DataFrame()
+if "volcano_fig" not in st.session_state:
+    st.session_state.volcano_fig = None
+if "ai_targets" not in st.session_state:
+    st.session_state.ai_targets = []
+if "de_engine" not in st.session_state:
+    st.session_state.de_engine = "PyDESeq2"
+if "pval_thresh" not in st.session_state:
+    st.session_state.pval_thresh = 0.0500
+if "log2fc_thresh" not in st.session_state:
+    st.session_state.log2fc_thresh = 2.0
+if "n_up_pathway" not in st.session_state:
+    st.session_state.n_up_pathway = 2
+if "n_down_pathway" not in st.session_state:
+    st.session_state.n_down_pathway = 1
+if "n_outliers" not in st.session_state:
+    st.session_state.n_outliers = 1
+
 # ==========================================
 # 1. GRAPH STATE & SCHEMAS
 # ==========================================
@@ -128,15 +128,9 @@ class AgentState(TypedDict):
     final_report: str
     custom_knowledge: str 
     analysis_mode: str
-    biomarker_intent: str 
-    max_deep_dive: int             
-    fast_triage_data: List[Dict[str, Any]]
-    selection_logic: str
     discarded_evidence: List[Dict[str, Any]] 
     ai_filtered_evidence: List[Dict[str, Any]]
-    expert_consensus: str
-    tme_deconvolution: Dict[str, Any]
-    therapeutic_modality: str  # <--- NEW: ADC / CAR-T Router
+    expert_consensus: str # <-- NEW: Holds the multi-agent debate
 
 class Plan(BaseModel):
     steps: List[str] = Field(description="Step-by-step plan of tools to execute.")
@@ -146,138 +140,9 @@ class PaperScore(BaseModel):
     score: int = Field(description="Relevance score from 1 to 10")
     reason: str = Field(description="Short 3-15 word reason (e.g., 'Acronym Collision', 'Strong evidence', 'Wrong Disease')")
 
-# --- NEW: AI FUNNEL SELECTION SCHEMAS (DR.KNOWS FORMAT) ---
-class KnowledgePath(BaseModel):
-    gene: str = Field(description="Hugo symbol")
-    path: str = Field(description="Strict DR.KNOWS format. E.g., '[HPA: Macrophage] -> EXCLUDE (Artifact)' or '[Detectability: Secreted] -> [TCGA: 8%] -> INCLUDE'")
-    status: str = Field(description="'INCLUDE' or 'EXCLUDE'")
-
 # ==========================================
 # 2. THE TOOLS (Python Functions)
 # ==========================================
-
-# --- THE NEW BRIDGE IN ultimate_agent.py ---
-
-from tme_core import TMECore
-
-def process_tme_logic(counts_df, meta_df):
-    """
-    This replaces those 1,000 lines of mess.
-    It calls the 'Kitchen' (tme_core) and returns the 'Meal' (stats/results).
-    """
-    try:
-        # 1. Initialize our Sprint-verified engine
-        engine = TMECore(counts_df, meta_df)
-        
-        # 2. Run the full pipeline (Consensus -> Stability -> Stats)
-        results, stats = engine.run_analysis()
-        
-        # 3. Return these to the new dashboard function (Step 2)
-        return results, stats
-        
-    except Exception as e:
-        st.error(f"🧬 TME Engine Error: {e}")
-        return None, None
-
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
-
-def render_tme_dashboard(results_df, stats_df):
-    """
-    Renders the clinical discovery results in the Streamlit UI.
-    """
-    # 1. THE RIGOR HEADER
-    st.subheader("🧬 Tumor Microenvironment (TME) Discovery")
-    
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Model Stability (κ)", "34.86", help="Condition Number < 40 is considered mathematically elite.")
-    
-    # Calculate Avg R2 from the results
-    avg_r2 = results_df['R2'].mean() if 'R2' in results_df.columns else 0.82
-    col_b.metric("Model Confidence (R²)", f"{avg_r2:.2f}")
-    
-    # Find the most significant finding
-    best_p = stats_df['P_Value'].min()
-    sig_cell = stats_df.loc[stats_df['P_Value'] == best_p, 'Cell_Type'].values[0]
-    col_c.metric("Key Driver", sig_cell, f"p={best_p:.2e}")
-
-    st.divider()
-
-    # 2. INTERACTIVE COMPARISON (Box Plots)
-    # Re-shaping data for Plotly (Long Format)
-    risk_col = [c for c in results_df.columns if 'risk' in c.lower() or 'condition' in c.lower()][0]
-    plot_df = results_df.melt(id_vars=['Sample_ID', risk_col, 'R2'], 
-                              value_vars=['Malignant', 'Stroma', 'Immune'],
-                              var_name='Cell_Type', value_name='Percentage')
-
-    fig_box = px.box(
-        plot_df, 
-        x='Cell_Type', 
-        y='Percentage', 
-        color=risk_col,
-        points="all", 
-        hover_data=['Sample_ID'],
-        color_discrete_map={'risk category: High': '#e74c3c', 'risk category: Average': '#3498db'},
-        title="Cellular Proportions: High vs. Average Risk"
-    )
-    
-    fig_box.update_layout(boxmode='group', height=500)
-    st.plotly_chart(fig_box, use_container_width=True)
-
-    # 3. STATISTICAL TRUTH TABLE
-    st.write("### 📊 Statistical Significance (Mann-Whitney U)")
-    # Format p-values for readability
-    display_stats = stats_df.copy()
-    display_stats['P_Value'] = display_stats['P_Value'].apply(lambda x: f"{x:.4e}")
-    st.dataframe(display_stats, hide_index=True, use_container_width=True)
-
-import plotly.express as px
-from tme_core import TMECore
-from dashboard_components import render_tme_dashboard
-
-# Inside your Streamlit or Dash app:
-def render_tme_tab(counts, meta):
-    engine = TMECore(counts, meta)
-    results, stats = engine.run_analysis()
-    
-    # 1. Interactive Box Plot
-    fig = px.box(results_merged, x="risk_category", y="Stroma", 
-                 points="all", title="Stromal Infiltration by Risk Group")
-    st.plotly_chart(fig)
-    
-    # 2. Stats Table
-    st.table(stats)
-    
-    # 3. Agent Interpretation
-    sig_cell = stats.loc[stats['P_Value'] < 0.05, 'Cell_Type'].tolist()
-    st.write(f"🤖 **Agent Note:** I detected significant differences in {', '.join(sig_cell)}. "
-             "The Malignant surge suggests increased tumor cellularity in the high-risk group.")
-
-def generate_tme_summary(stats_df):
-    """
-    Translates p-values into a biological story for the LLM.
-    """
-    findings = []
-    
-    # 1. Check for the "Malignant Surge"
-    malig_p = stats_df.loc[stats_df['Cell_Type'] == 'Malignant', 'P_Value'].values[0]
-    if malig_p < 0.05:
-        findings.append("significant increase in tumor cellularity (Malignant axis)")
-
-    # 2. Check the "Stroma Paradox"
-    stroma_p = stats_df.loc[stats_df['Cell_Type'] == 'Stroma', 'P_Value'].values[0]
-    if stroma_p < 0.05:
-        findings.append("a distinct remodeling of the extracellular matrix (Stroma axis)")
-
-    # 3. Check for Immune Exclusion
-    immune_p = stats_df.loc[stats_df['Cell_Type'] == 'Immune', 'P_Value'].values[0]
-    if immune_p > 0.05:
-        findings.append("a statistically stable immune environment across risk groups")
-
-    summary = f"The cohort analysis reveals {', '.join(findings)}."
-    return summary
-
 @st.cache_data(ttl="1d", show_spinner=False)
 def get_gene_info(hugo_symbol):
     """Fetches biological context, gene type, and aliases."""
@@ -301,7 +166,7 @@ def get_gene_info(hugo_symbol):
         return {"status": "Gene info not found."}
     except Exception as e:
         return {"status": f"API Error: {str(e)}"}
-
+    
 @st.cache_data(ttl="1d", show_spinner=False)
 def fetch_normal_tissue_profile(hugo_symbol):
     """Acts as a proxy for the GTEx / Human Protein Atlas databases."""
@@ -333,31 +198,17 @@ def run_gsea_analysis(full_df):
     rnk = df[['rank_metric']]
     
     try:
-        try:
-            # 3. Attempt GSEA Prerank locally with multiprocessing
-            pre_res = gp.prerank(
-                rnk=rnk, 
-                gene_sets='KEGG_2021_Human',
-                threads=4, 
-                min_size=5, 
-                max_size=1000,
-                permutation_num=100, 
-                outdir=None, 
-                seed=42
-            )
-        except Exception as thread_e:
-            print(f"⚠️ Multiprocessing warning: {thread_e}. Falling back to single thread...")
-            # 3b. Safe fallback for Windows/Anaconda environments
-            pre_res = gp.prerank(
-                rnk=rnk, 
-                gene_sets='KEGG_2021_Human',
-                threads=1, 
-                min_size=5, 
-                max_size=1000,
-                permutation_num=100, 
-                outdir=None, 
-                seed=42
-            )
+        # 3. Attempt GSEA Prerank locally (FORCED threads=1 to prevent Windows fork bombs!)
+        pre_res = gp.prerank(
+            rnk=rnk, 
+            gene_sets='KEGG_2021_Human',
+            threads=1, 
+            min_size=5, 
+            max_size=1000,
+            permutation_num=100, 
+            outdir=None, 
+            seed=42
+        )
         
         res_df = pre_res.res2d
         
@@ -410,17 +261,17 @@ def get_onco_data(hugo, alteration, tumor_type):
         return {"status": f"Request failed: {str(e)}"}
 
 @st.cache_data(ttl="1d", show_spinner=False)
-def search_pubmed(gene, tumor_type, mode="Clinical Triage", intent="Therapeutic", aliases="", interactors=None):
+def search_pubmed(gene, tumor_type, mode="Clinical Triage", aliases="", interactors=None):
     if interactors is None: interactors = []
     
-    # 1. FORMAT ALIASES
     alias_query = ""
     if aliases and aliases != "Unknown":
+        # NEW: Only keep aliases longer than 3 characters to prevent massive acronym pollution!
         alias_list = [a.strip() for a in aliases.split(',') if len(a.strip()) > 3][:2]
         if alias_list:
             alias_query = " OR " + " OR ".join([f"{a}[TIAB]" for a in alias_list])
 
-    # 2. DEFINE THE BROAD SEARCH NET (The "Search Term")
+    # --- NEW: UNCONDITIONAL NETWORK PULL FOR DISCOVERY ---
     if "Discovery" in mode and interactors:
         network_nodes = [gene] + interactors
         network_query_str = " OR ".join([f"{n}[TIAB]" for n in network_nodes])
@@ -430,59 +281,61 @@ def search_pubmed(gene, tumor_type, mode="Clinical Triage", intent="Therapeutic"
         broad_query = f"({gene}[TIAB]{alias_query}) AND {tumor_type}[TIAB]"
         prov_step_1 = f"**Phase 1 (Broad Target Pull):** PubMed query `[{broad_query}]`."
     
-    # 3. DEFINE THE SEMANTIC INTENT (The "FAISS filter")
-    if "Diagnostic" in intent:
-        semantic_query = f"Diagnostic biomarker, liquid biopsy, ELISA blood test, early detection, risk stratification, and prognostic survival outcomes in {tumor_type}."
-    elif "Discovery" in mode:
-        semantic_query = f"Novel biomarkers, signaling pathways, lipid metabolism, immunotherapy targets, and resistance mechanisms in {tumor_type}."
-    else:
-        semantic_query = f"FDA approved targeted therapy, survival outcomes, and clinical trial results for {tumor_type}."
-
-    # 4. EXECUTE PUBMED API CALLS
     search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     search_params = {"db": "pubmed", "term": broad_query, "retmode": "json", "retmax": 40}
     
     try:
         res = requests.get(search_url, params=search_params)
         if res.status_code != 200: return {"status": f"Search Error: {res.status_code}"}
+            
         id_list = res.json().get("esearchresult", {}).get("idlist", [])
         if not id_list: return {"status": "No experimental literature found."}
             
         time.sleep(0.5) 
         fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
         fetch_params = {"db": "pubmed", "id": ",".join(id_list), "retmode": "xml"}
-        fetch_res = requests.get(fetch_url, params=fetch_params)
         
+        fetch_res = requests.get(fetch_url, params=fetch_params)
+        if fetch_res.status_code != 200: return {"status": "PubMed Fetch Error"}
+            
         papers = []
         root = ET.fromstring(fetch_res.content)
         for article in root.findall('.//PubmedArticle'):
             pmid = article.find('.//PMID').text if article.find('.//PMID') is not None else "Unknown"
             title = article.find('.//ArticleTitle').text if article.find('.//ArticleTitle') is not None else "No Title"
+            
             abstract_nodes = article.findall('.//AbstractText')
             abstract_text = " ".join([node.text for node in abstract_nodes if node.text]) if abstract_nodes else ""
+                
             if abstract_text: 
                 papers.append({"PMID": pmid, "Title": title, "Abstract": abstract_text[:1500]})
                 
-        if not papers: 
-            return {"status": "No abstracts passed the initial filter.", "papers": [], "provenance": [prov_step_1 + " Yielded 0 relevant candidates."]}
+        if not papers: return {"status": "No abstracts available to embed."}
 
-        # 5. SEMANTIC RAG FILTER (FAISS)
-        st.markdown(f"      -> Embedding {len(papers)} abstracts into FAISS for {gene}...")
+        # --- 2. SEMANTIC FILTER (FAISS VECTOR DB) ---
+        st.markdown(f"      -> Embedding {len(papers)} abstracts into FAISS for {gene} network...")
         docs = [LCDocument(page_content=f"Title: {p['Title']}\nAbstract: {p['Abstract']}", metadata=p) for p in papers]
+        
         embeddings = OpenAIEmbeddings(api_key=openai_key)
         vectorstore = FAISS.from_documents(docs, embeddings)
         
+        if "Discovery" in mode:
+            semantic_query = f"Novel biomarkers, signaling pathways, lipid metabolism, immunotherapy targets, and resistance mechanisms in {tumor_type}."
+        else:
+            semantic_query = f"FDA approved targeted therapy, survival outcomes, and clinical trial results for {tumor_type}."
+            
         retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
         relevant_docs = retriever.invoke(semantic_query)
         top_papers = [{"PMID": d.metadata["PMID"], "Title": d.metadata["Title"], "Abstract": d.metadata["Abstract"]} for d in relevant_docs]
         
-        # 6. PROVENANCE LOGGING
+        # --- 3. PROVENANCE LOGGING ---
         provenance = [
             prov_step_1 + f" Yielded {len(id_list)} candidates.",
             f"**Phase 2 (Semantic Sorting):** Embedded {len(papers)} valid abstracts into FAISS Vector DB.",
-            f"**Phase 3 (Concept Retrieval):** Extracted top 10 papers using diagnostic-aware query: *'{semantic_query}'*.",
-            f"**Phase 4 (Expert Review):** Top semantic matches passed to the AI Scorer for strict triage."
+            f"**Phase 3 (Concept Retrieval):** Extracted top 10 papers by mathematical proximity to: *'{semantic_query}'*.",
+            f"**Phase 4 (Expert Review):** Top semantic matches passed to the AI Scorer for strict clinical triage."
         ]
+        
         return {"status": "Success", "papers": top_papers, "provenance": provenance}
         
     except Exception as e:
@@ -520,41 +373,6 @@ def search_clinical_trials(gene, tumor_type):
         return {"status": f"ClinicalTrials Error: {res.status_code}"}
     except Exception as e:
         return {"status": f"Request failed: {str(e)}"}
-
-@st.cache_data(show_spinner=False)
-def check_biomarker_detectability(gene_symbol: str) -> str:
-    """Queries HPA to see if the protein is secreted into blood or exists on the cell surface."""
-    # We use 'pc' (Protein class) again, but with strict parsing this time!
-    url = f"https://www.proteinatlas.org/api/search_download.php?search={gene_symbol}&format=json&columns=g,pc&compress=no"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers)
-        if res.status_code == 200:
-            try:
-                data = res.json()
-            except ValueError:
-                return "HPA API returned an invalid response (likely HTML)."
-                
-            for entry in data:
-                if entry.get("Gene", "").upper() == gene_symbol.upper():
-                    classes = entry.get("Protein class", [])
-                    classes_str = ", ".join(classes) if isinstance(classes, list) else str(classes)
-                    
-                    # THE STRICT FIX: Look for HPA's exact biological classification tags
-                    is_secreted = "Predicted secreted" in classes_str
-                    is_membrane = "Predicted membrane" in classes_str
-                    
-                    if is_secreted:
-                        return f"DETECTABILITY: High. {gene_symbol} is a secreted protein, making it a prime candidate for ELISA blood tests or liquid biopsies."
-                    elif is_membrane:
-                        return f"DETECTABILITY: Moderate. {gene_symbol} is a membrane protein. It may be shed in exosomes or detectable via flow cytometry/CTCs."
-                    else:
-                        return f"DETECTABILITY: Low. {gene_symbol} is intracellular. Clinical detection would require an invasive tissue biopsy."
-            return f"No detectability/secretome data found for {gene_symbol}."
-        else:
-            return f"Secretome API Error: {res.status_code}"
-    except Exception as e:
-        return f"Exception: {str(e)}"
 
 @st.cache_data(ttl="1d", show_spinner=False)
 def get_protein_interactions(hugo_symbol):
@@ -705,210 +523,6 @@ def get_uniprot_id(hugo_symbol):
         return None
     except Exception:
         return None
-
-def get_tcga_population_frequency(gene_symbol: str, cancer_type: str) -> str:
-    """Queries cBioPortal (TCGA) to find the real-world alteration frequency (mutations/amplifications) of a target gene in human populations."""
-    # Expanded TCGA Pan-Cancer Atlas Mapping
-    cancer_map = {
-        "breast": "brca_tcga_pan_can_atlas_2018",
-        "melanoma": "skcm_tcga_pan_can_atlas_2018",
-        "lung": "luad_tcga_pan_can_atlas_2018",        # Lung Adenocarcinoma
-        "squamous lung": "lusc_tcga_pan_can_atlas_2018",
-        "colon": "coadread_tcga_pan_can_atlas_2018",   # Colorectal
-        "prostate": "prad_tcga_pan_can_atlas_2018",
-        "brain": "gbm_tcga_pan_can_atlas_2018",        # Glioblastoma
-        "glioma": "lgg_tcga_pan_can_atlas_2018",       # Lower Grade Glioma
-        "pancreas": "paad_tcga_pan_can_atlas_2018",
-        "ovary": "ov_tcga_pan_can_atlas_2018",
-        "cervix": "cesc_tcga_pan_can_atlas_2018",
-        "liver": "lihc_tcga_pan_can_atlas_2018",       # Hepatocellular Carcinoma
-        "kidney": "kirc_tcga_pan_can_atlas_2018",      # Renal Clear Cell
-        "stomach": "stad_tcga_pan_can_atlas_2018",     # Gastric
-        "bladder": "blca_tcga_pan_can_atlas_2018",
-        "thyroid": "thca_tcga_pan_can_atlas_2018",
-        "head and neck": "hnsc_tcga_pan_can_atlas_2018",
-        "sarcoma": "sarc_tcga_pan_can_atlas_2018",
-        "leukemia": "laml_tcga_pan_can_atlas_2018"     # Acute Myeloid Leukemia
-    }
-    
-    study_id = None
-    for key, val in cancer_map.items():
-        if key in cancer_type.lower():
-            study_id = val
-            break
-            
-    if not study_id:
-        return f"TCGA mapping not found for {cancer_type}. Assuming broad pan-cancer context."
-
-    # 1. Get Entrez ID
-    entrez_url = f"https://mygene.info/v3/query?q=symbol:{gene_symbol}&fields=entrezgene&species=human"
-    try:
-        entrez_res = requests.get(entrez_url).json()
-        entrez_id = entrez_res["hits"][0]["entrezgene"]
-    except:
-        return f"Could not map {gene_symbol} to Entrez ID."
-
-    base_url = "https://www.cbioportal.org/api"
-    sample_list_id = f"{study_id}_all"
-    
-    try:
-        # Get cohort size
-        samples_res = requests.get(f"{base_url}/studies/{study_id}/samples")
-        total_samples = len(samples_res.json())
-
-        # Get Mutations
-        mut_url = f"{base_url}/molecular-profiles/{study_id}_mutations/mutations?entrezGeneId={entrez_id}&sampleListId={sample_list_id}"
-        mutated_samples = {m.get("sampleId") for m in requests.get(mut_url).json()} if requests.get(mut_url).status_code == 200 else set()
-
-        # Get CNAs (Amplifications/Deletions)
-        cna_url = f"{base_url}/molecular-profiles/{study_id}_cna/discrete-copy-number-alterations?entrezGeneId={entrez_id}&sampleListId={sample_list_id}"
-        altered_cna_samples = {c.get("sampleId") for c in requests.get(cna_url).json() if c.get("alteration") in [2, -2]} if requests.get(cna_url).status_code == 200 else set()
-
-        total_altered = len(mutated_samples.union(altered_cna_samples))
-        alteration_rate = round((total_altered / total_samples) * 100, 2) if total_samples > 0 else 0
-
-        return f"TCGA POPULATION REALITY CHECK for {gene_symbol}: Altered in {alteration_rate}% of {cancer_type} patients ({total_altered} out of {total_samples} cases). Breakthrough target if >10%, niche sub-population if >2%, and likely an underpowered passenger if <1%."
-    except Exception as e:
-        return f"cBioPortal API Error: {str(e)}"
-
-@st.cache_data(ttl="1d", show_spinner=False)
-def check_clinical_survival(gene_symbol: str, cancer_type: str) -> str:
-    """Queries HPA Pathology prognostics to see if high expression mathematically correlates with patient survival."""
-    url = f"https://www.proteinatlas.org/api/search_download.php?search={gene_symbol}&format=json&columns=g,pg&compress=no"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
-    try:
-        res = requests.get(url, headers=headers).json()
-        for entry in res:
-            if entry.get("Gene", "").upper() == gene_symbol.upper():
-                prognostics = entry.get("Pathology prognostics", "")
-                
-                if not prognostics:
-                    return f"No significant TCGA survival correlation found for {gene_symbol}."
-                
-                # Parse the specific cancer type out of the HPA string
-                # E.g., HPA returns: "Breast cancer (unfavorable), Lung cancer (favorable)"
-                cancer_focus = cancer_type.lower().split()[0] # e.g., "Breast" from "Breast cancer"
-                
-                if cancer_focus in prognostics.lower():
-                    # Extract just the relevant piece
-                    prog_list = prognostics.split(",")
-                    for p in prog_list:
-                        if cancer_focus in p.lower():
-                            if "unfavorable" in p.lower():
-                                return f"🚨 CLINICAL SURVIVAL ALERT: High expression of {gene_symbol} is statistically linked to POORER overall survival (unfavorable prognosis) in {cancer_type}."
-                            elif "favorable" in p.lower():
-                                return f"🛡️ CLINICAL SURVIVAL ALERT: High expression of {gene_symbol} is statistically linked to BETTER overall survival (favorable prognosis) in {cancer_type}."
-                
-                return f"Survival data exists for {gene_symbol} in other cancers, but not significantly correlated in {cancer_type}."
-                
-        return f"No survival data found for {gene_symbol}."
-    except Exception as e:
-        return f"Survival API Error: {str(e)}"
-
-def get_single_cell_artifact_data(gene_symbol: str) -> str:
-    """Queries the Human Protein Atlas (HPA) to determine the microscopic single-cell origin of a gene. Critical for detecting immune or stromal tissue admixture artifacts!"""
-    # 1. Get official HPA Ensembl ID
-    id_url = f"https://www.proteinatlas.org/api/search_download.php?search={gene_symbol}&format=json&columns=g,eg&compress=no"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    ensembl_id = None
-    try:
-        id_data = requests.get(id_url, headers=headers).json()
-        for entry in id_data:
-            if entry.get("Gene", "").upper() == gene_symbol.upper():
-                ensembl_val = entry.get("Ensembl")
-                ensembl_id = ensembl_val[0] if isinstance(ensembl_val, list) else ensembl_val
-                break
-    except:
-        return f"Failed to resolve HPA Ensembl ID for {gene_symbol}."
-
-    if not ensembl_id:
-        return f"No Ensembl ID found for {gene_symbol}."
-
-    # 2. Get Single Cell Data from the Backdoor
-    master_url = f"https://www.proteinatlas.org/{ensembl_id}.json"
-    try:
-        master_data = requests.get(master_url, headers=headers).json()
-        entry = master_data[0] if isinstance(master_data, list) else master_data
-        
-        cell_types = {}
-        for key, val in entry.items():
-            if "single cell type specific" in key.lower() and isinstance(val, dict):
-                for cell, expr in val.items():
-                    try:
-                        cell_types[cell.strip()] = float(expr)
-                    except ValueError:
-                        pass
-                break
-                
-        if not cell_types:
-            return f"No microscopic single-cell data found for {gene_symbol}. Assume broad epithelial or systemic expression."
-            
-        sorted_cells = sorted(cell_types.items(), key=lambda item: item[1], reverse=True)[:5]
-        top_cells_str = ", ".join([f"{c[0]} ({c[1]} nTPM)" for c in sorted_cells])
-        
-        return f"SINGLE-CELL ARTIFACT CHECK for {gene_symbol}: Predominantly expressed in: {top_cells_str}. WARNING: If these are Macrophages, T-cells, Kupffer cells, or Adipocytes, this is a tissue admixture artifact, NOT a tumor-intrinsic mutation!"
-    except Exception as e:
-        return f"HPA API Error: {str(e)}"
-
-def check_biomarker_detectability(gene_symbol: str) -> str:
-    """Queries HPA to see if the protein is secreted into blood or exists on the cell surface (for liquid biopsy/flow cytometry)."""
-    url = f"https://www.proteinatlas.org/api/search_download.php?search={gene_symbol}&format=json&columns=g,pc,sec,pt&compress=no"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers).json()
-        for entry in res:
-            if entry.get("Gene", "").upper() == gene_symbol.upper():
-                classes = entry.get("Protein class", [])
-                classes_str = ", ".join(classes) if isinstance(classes, list) else str(classes)
-                
-                is_secreted = "Secreted" in classes_str or "Plasma" in classes_str
-                is_membrane = "Membrane" in classes_str
-                
-                if is_secreted:
-                    return f"DETECTABILITY: High. {gene_symbol} is a secreted/plasma protein, making it a prime candidate for ELISA blood tests or liquid biopsies."
-                elif is_membrane:
-                    return f"DETECTABILITY: Moderate. {gene_symbol} is a membrane protein. It may be shed in exosomes or detectable via flow cytometry/CTCs."
-                else:
-                    return f"DETECTABILITY: Low. {gene_symbol} is predominantly intracellular. Clinical detection would require an invasive tissue biopsy."
-        return "No detectability/secretome data found."
-    except Exception as e:
-        return f"Secretome API Error: {str(e)}"
-
-@st.cache_data(show_spinner=False)
-def get_validated_antibodies(gene_symbol: str) -> str:
-    """Fetches validated IHC antibody catalog numbers from the Human Protein Atlas."""
-    id_url = f"https://www.proteinatlas.org/api/search_download.php?search={gene_symbol}&format=json&columns=g,eg&compress=no"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    ensembl_id = None
-    try:
-        id_data = requests.get(id_url, headers=headers).json()
-        for entry in id_data:
-            if entry.get("Gene", "").upper() == gene_symbol.upper():
-                ensembl_val = entry.get("Ensembl")
-                ensembl_id = ensembl_val[0] if isinstance(ensembl_val, list) else ensembl_val
-                break
-    except:
-        return "No antibody data found."
-
-    if not ensembl_id: return "No antibody data found."
-
-    master_url = f"https://www.proteinatlas.org/{ensembl_id}.json"
-    try:
-        master_data = requests.get(master_url, headers=headers).json()
-        entry = master_data[0] if isinstance(master_data, list) else master_data
-        
-        # Extract the antibody list and the IHC reliability score
-        antibodies = entry.get("Antibody", [])
-        ihc_reliability = entry.get("Reliability (IH)", "Unknown")
-        
-        # Only recommend antibodies that HPA has explicitly approved or supported for IHC
-        if antibodies and ihc_reliability in ["Approved", "Supported", "Enhanced"]:
-            ab_list = ", ".join(antibodies) if isinstance(antibodies, list) else antibodies
-            return f"HPA-Validated IHC Antibodies: {ab_list} (Reliability: {ihc_reliability})."
-        return f"No highly validated IHC antibodies found in HPA for {gene_symbol}."
-    except Exception:
-        return "Error fetching antibody data."
 
 @st.cache_data(ttl="1d", show_spinner=False)
 def fetch_alphafold_structure(uniprot_id):
@@ -1074,146 +688,29 @@ def planner_node(state: AgentState):
     
     return {"plan": response.steps}
 
-def fast_triage_node(state: AgentState):
-    st.markdown("⚡ **[NODE: Fast Triage]** Running the high-speed gauntlet...")
-    st.caption("*The AI is pulling data from 4 free databases to quickly grade all candidates: MyGene (Biology), GTEx (Normal Tissue), cBioPortal (TCGA Mutation Frequency), and Human Protein Atlas (Single-Cell Origin/Secretome).*")
-    
-    genes = state.get("significant_genes", [])
-    intent = state.get("biomarker_intent", "Therapeutic")
-    triage_results = []
-    
-    for gene_info in genes:
-        hugo = gene_info.get("hugo")
-        tumor_type = gene_info.get("tumor_type")
-        
-        st.markdown(f"      -> Running fast APIs for {hugo}...")
-        # Cheap/Fast API Calls ONLY
-        gene_context = get_gene_info(hugo)
-        tissue = fetch_normal_tissue_profile(hugo)
-        tcga = get_tcga_population_frequency(hugo, tumor_type)
-        hpa = get_single_cell_artifact_data(hugo)
-        
-        triage_data = {
-            "gene": hugo,
-            "biology": gene_context.get('summary', 'No summary.'),
-            "tissue_gtex": tissue,
-            "hpa_single_cell": hpa,
-            "tcga_freq": tcga
-        }
-        
-        if "Diagnostic" in intent:
-            triage_data["detectability"] = check_biomarker_detectability(hugo)
-        else:
-            triage_data["open_targets"] = fetch_target_tractability(hugo)
-            
-        triage_results.append(triage_data)
-        
-    return {"fast_triage_data": triage_results}
-
-# --- THE SCHEMA ---
-class SelectionResult(BaseModel):
-    evaluations: List[KnowledgePath] = Field(description="The evaluation path for every single gene processed.")
-    top_candidates: List[str] = Field(description="List of Hugo symbols chosen for the Deep Dive. Can be empty if none pass, or up to 5 maximum.")
-
-# --- THE NODE ---
-# --- THE NODE ---
-def intelligent_selection_node(state: AgentState):
-    st.markdown("⚖️ **[NODE: Intelligent Selection]** AI grading Knowledge Paths to draft top candidates...")
-    llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key)
-    structured_llm = llm.with_structured_output(SelectionResult)
-    
-    triage_data = state.get("fast_triage_data", [])
-    intent = state.get("biomarker_intent", "Therapeutic")
-    modality = state.get("therapeutic_modality", "Small Molecule / Kinase Inhibitor") # <--- Pulled from state
-    max_limit = state.get("max_deep_dive", 5)
-    
-    # --- DYNAMIC MODALITY WEIGHTING ---
-    modality_rules = "- For Therapeutics: Prioritize high tractability (Druggable) and high DepMap essentiality."
-    if modality == "CAR-T / ADC / Radioligand":
-        modality_rules = """
-        - CAR-T/ADC STRICT ROUTING: You MUST IGNORE DepMap essentiality (bystander effects make essentiality irrelevant).
-        - You MUST strictly mandate Cell Surface Localization (Membrane) via HPA/UniProt.
-        - You MUST heavily penalize ubiquitous normal tissue expression (GTEx) to prevent fatal off-tumor/on-target toxicity.
-        """
-    
-    sys_msg = f"""You are the Lead Bioinformatics Architect.
-    Evaluate these {len(triage_data)} candidates for a {intent} pipeline.
-    Select all viable candidates to advance to the deep-dive literature review. 
-    (Return anywhere from 0 to {max_limit} maximum candidates. If more than {max_limit} are viable, select the absolute best {max_limit}).
-    
-    TISSUE CONTEXT & ADMIXTURE (NO MORE KILL SWITCH):
-    If the 'hpa_single_cell' data indicates the gene is predominantly expressed in Macrophages, T-cells, Kupffer cells, or Adipocytes, DO NOT automatically exclude it. Instead, evaluate if it is a highly viable 'Tumor Microenvironment (TME) Biomarker'. 
-    - If it is a useless normal-tissue artifact (e.g., salivary gland in breast cancer), EXCLUDE it.
-    - If it is a highly detectable immune/TME biomarker, INCLUDE it, but explicitly label its path as a TME marker.
-    
-    SOFT WEIGHTS:
-    {modality_rules}
-    - For Diagnostics: Prioritize 'Secreted/Plasma' detectability.
-    - TCGA Frequency: Expect novel RNA targets to have <1% mutation frequency. Do not penalize them for this unless you are specifically looking for DNA drivers.
-    
-    OUTPUT FORMAT (DR.KNOWS):
-    You must provide a reasoning path for EVERY gene evaluated.
-    Example: "[HPA: Salivary Gland] -> EXCLUDE (Unrelated Normal Tissue Artifact)"
-    Example: "[HPA: Macrophage] -> [Detectability: Secreted] -> INCLUDE (Rank 1: TME Liquid Biopsy Marker)"
-    """
-    
-    response = structured_llm.invoke([
-        SystemMessage(content=sys_msg),
-        HumanMessage(content=json.dumps(triage_data))
-    ])
-    
-    # 1. Clean the strings to ensure perfect matching
-    top_cands = [c.strip().upper() for c in response.top_candidates]
-    original_genes = state.get("significant_genes", [])
-    winning_genes = [g for g in original_genes if str(g["hugo"]).strip().upper() in top_cands]
-    
-    # 2. Format the DR.KNOWS reasoning
-    logic_str = "\n".join([f"- **{p.gene}**: {p.path}" for p in response.evaluations])
-    
-    # 3. THE FAIL-SAFE: If the AI rejected everything, force the pipeline to continue!
-    if not winning_genes:
-        winning_genes = original_genes[:max_limit]
-        logic_str += f"\n\n⚠️ **SYSTEM OVERRIDE:** The AI rejected all {len(triage_data)} candidates based on the strict HPA guardrails. Forcing the top {max_limit} statistical targets through the deep dive to prevent pipeline starvation."
-    
-    # 4. FIX TRANSPARENCY: Use markdown so it prints visibly inside the trace
-    st.markdown(f"### 🧠 AI Funnel Reasoning\n{logic_str}")
-    
-    return {
-        "significant_genes": winning_genes, 
-        "selection_logic": logic_str
-    }
-
 def executor_node(state: AgentState):
     plan_text = " ".join(state.get("plan", [])).lower()
-    winning_genes = state.get("significant_genes", []) # ONLY the winners from the Selection node!
-    fast_data = state.get("fast_triage_data", [])      # Grab the fast data we already fetched
-    intent = state.get("biomarker_intent", "Therapeutic")
+    genes = state.get("significant_genes", [])
     new_evidence = []
     
-    for gene_info in winning_genes:
+    for gene_info in genes:
         hugo = gene_info.get("hugo")
         alt = gene_info.get("alteration")
         tumor_type = gene_info.get("tumor_type")
         source_tag = gene_info.get("source", "Unknown Source")
         
-        # Pull the fast triage dossier we already built for this specific gene!
-        fast_dossier = next((item for item in fast_data if item["gene"] == hugo), {})
-        
-        # We still do a fast cache-fetch for biology aliases needed for PubMed
+        # NEW: Automatically fetch the biological definition first!
+        st.markdown(f"   -> Fetching biological context for {hugo}...")
         gene_context = get_gene_info(hugo)
-        gene_context["normal_tissue_gtex"] = fast_dossier.get("tissue_gtex", "Unknown") 
+        
+        # --- NEW: GTEX TISSUE SANITY CHECK ---
+        st.markdown(f"      -> Profiling GTEx normal tissue distribution for {hugo}...")
+        tissue_profile = fetch_normal_tissue_profile(hugo)
+        gene_context["normal_tissue_gtex"] = tissue_profile # Add it to the biology dictionary!
         
         report = {"gene": hugo, "alteration": alt, "source": source_tag, "biology": gene_context, "evidence": {}}
         
-        # --- CARRY OVER THE FAST DATA (No API calls required!) ---
-        report["evidence"]["TCGA_Frequency"] = fast_dossier.get("tcga_freq", "Unknown")
-        report["evidence"]["HPA_SingleCell"] = fast_dossier.get("hpa_single_cell", "Unknown")
-        if "Diagnostic" in intent:
-            report["evidence"]["Detectability"] = fast_dossier.get("detectability", "Unknown")
-        else:
-            report["evidence"]["OpenTargets"] = fast_dossier.get("open_targets", {})
-
-        # --- 1. UNIPROT STRUCTURAL AWARENESS ---
+        # --- NEW: UNIPROT STRUCTURAL AWARENESS ---
         st.markdown(f"      -> Hunting UniProt for Active Sites for {hugo}...")
         uniprot_id = get_uniprot_id(hugo)
         if uniprot_id:
@@ -1224,38 +721,35 @@ def executor_node(state: AgentState):
                 "note": "If > 0, this protein has known druggable active sites/pockets."
             }
             
-        # --- 2. EXTRACT VALIDATED IHC ANTIBODIES ---
-        st.markdown(f"      -> Extracting validated IHC Antibodies for {hugo}...")
-        report["evidence"]["IHC_Antibodies"] = get_validated_antibodies(hugo)
-
-        # --- 2.5 CLINICAL SURVIVAL ANALYTICS ---
-        st.markdown(f"      -> Querying TCGA Kaplan-Meier Survival Outcomes for {hugo}...")
-        report["evidence"]["Survival_Outcomes"] = check_clinical_survival(hugo, tumor_type)
+        # --- NEW: FETCH OPEN TARGETS TRACTABILITY & ESSENTIALITY ---
+        st.markdown(f"      -> Fetching Tractability & Essentiality for {hugo}...")
+        report["evidence"]["OpenTargets"] = fetch_target_tractability(hugo)
         
-        # --- 3. ONCOKB ---
         if "oncokb" in plan_text:
             report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
             
-        # --- 4. STRING NETWORK ---
+        # 1. FETCH THE NETWORK FIRST!
         if "Discovery" in state.get("analysis_mode", "Clinical Triage"):
             st.markdown(f"      -> Fetching STRING protein network for {hugo}...")
             report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
             
-        # --- 5. PUBMED DEEP DIVE (RAG) ---
+        # 2. THEN FETCH PUBMED
         if "pubmed" in plan_text:
+            # EXTRACT THE NETWORK WE JUST FETCHED!
             interactors = report.get("evidence", {}).get("STRING_Interactions", {}).get("interacting_proteins", [])
             
             pubmed_data = search_pubmed(
                 hugo, 
                 tumor_type, 
                 mode=state.get("analysis_mode", "Clinical Triage"),
-                intent=intent, 
                 aliases=gene_context.get("aliases", ""),
-                interactors=interactors
+                interactors=interactors # <-- Pass the network into the tool!
             )
             
+            # NEW: Save the Semantic Search Provenance Log!
             report["evidence"]["PubMed_Provenance"] = pubmed_data.get("provenance", [])
             
+            # --- AI RELEVANCE SCORER (OVERSAMPLE & FILTER) ---
             if pubmed_data.get("status") == "Success" and pubmed_data.get("papers"):
                 st.markdown(f"   -> Grading literature relevance for {hugo}...")
                 grader_llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key).with_structured_output(PaperScore)
@@ -1267,8 +761,10 @@ def executor_node(state: AgentState):
                 bio_summary = gene_context.get('summary', 'No summary available.')
                 
                 for p in candidate_papers:
-                    if len(good_papers) >= 3: break # Max 3 papers per gene
-                    
+                    if len(good_papers) >= 3:
+                        break # We found 3 good papers! Stop grading to save OpenAI tokens.
+                        
+                    # NEW: Tell the scorer to accept network interactions!
                     network_str = f" OR its immediate functional network ({', '.join(interactors)})" if interactors else ""
                     
                     eval_prompt = f"""
@@ -1276,8 +772,8 @@ def executor_node(state: AgentState):
                     Biological Function of {hugo}: {bio_summary}
                     
                     CRITICAL RUBRIC:
-                    - Score 1-4: Acronym collision, unrelated disease, or irrelevant biology.
-                    - Score 5-10: Relevant. The primary gene {hugo} {network_str} is mentioned in a functional, prognostic, or diagnostic context.
+                    - Score 1-4: Acronym collision (e.g., the gene symbol refers to a drug/procedure), completely unrelated disease, or irrelevant biology.
+                    - Score 5-10: Relevant. The primary gene {hugo} {network_str} is mentioned in a functional, prognostic, or therapeutic context. (Score highly if it validates the target's network!).
                     
                     Title: {p['Title']}
                     Abstract: {p['Abstract'][:800]}
@@ -1294,163 +790,131 @@ def executor_node(state: AgentState):
                         if score_result.score >= 5:
                             good_papers.append(p)
                         else:
+                            # Toss it into the AI's trash can!
                             ai_filtered_evidence = state.get("ai_filtered_evidence", [])
                             ai_filtered_evidence.append({
-                                "Gene": hugo, "Score": score_result.score, "Reason": score_result.reason,
-                                "Title": p["Title"], "PMID": p["PMID"]
+                                "Gene": hugo,
+                                "Score": score_result.score,
+                                "Reason": score_result.reason,
+                                "Title": p["Title"],
+                                "PMID": p["PMID"]
                             })
                             state["ai_filtered_evidence"] = ai_filtered_evidence
                             
                     except Exception as e:
+                        print(f"Scoring failed for {hugo}: {e}")
                         p["AI_Score"] = "?"
                         p["AI_Reason"] = "Error"
-                        good_papers.append(p) 
+                        good_papers.append(p) # Keep it if scoring fails just to be safe
                 
+                # Replace the massive list of 10 papers with ONLY the good ones
                 pubmed_data["papers"] = good_papers
+                        
             report["evidence"]["PubMed"] = pubmed_data
 
-        # --- 6. CLINICAL TRIALS ---
         if "clinicaltrials" in plan_text or "trials" in plan_text:
             st.markdown(f"   -> Fetching Clinical Trials for {hugo}...")
             report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
             
         new_evidence.append(report)
-        time.sleep(1.5) 
+        time.sleep(1.5) # <-- NEW: Prevent OpenTargets/PubMed API rate-limiting!
         
-    # Overwrite the gathered_evidence with the brand new deep dive reports!
-    return {
-        "gathered_evidence": new_evidence, 
-        "pathway_data": state.get("pathway_data"), 
-        "ai_filtered_evidence": state.get("ai_filtered_evidence", [])
-    }
+    return {"gathered_evidence": new_evidence, "pathway_data": state.get("pathway_data"), "ai_filtered_evidence": state.get("ai_filtered_evidence", [])}
 
 def clinical_review_node(state: AgentState):
-    st.markdown("🧑‍⚕️ **[NODE: Clinical Review]** Experts are debating the evidence...")
+    st.markdown("🧑‍⚕️ **[NODE: Clinical Review]** Pathologist and Oncologist are debating...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0.3, api_key=openai_key)
-    intent = state.get("biomarker_intent", "Therapeutic")
     
-    if "Diagnostic" in intent:
-        prompt = f"""
-        You are hosting a clinical tumor board. Review this data for {state.get('user_prompt')}.
-        Clean Evidence: {json.dumps(state.get('gathered_evidence'))}
-        
-        First, speak as a MOLECULAR PATHOLOGIST: Evaluate the tissue context. CRITICAL: Compare the gene's "normal_tissue_gtex" and HPA Single-Cell data against the {state.get('user_prompt')} context. Flag any lineage artifacts or stromal/immune admixture.
-        Second, speak as a CLINICAL CHEMIST: Evaluate the 'Detectability' secretome data. Is this a viable liquid biopsy (blood) candidate, or does it require an invasive tissue biopsy?
-        Third, speak as a BIOINFORMATICS AUDITOR: Audit the PubMed literature for Acronym Collisions. Name any disconnected papers and command the Medical Writer to ignore them.
-        """
-    else:
-        prompt = f"""
-        You are hosting a clinical tumor board. Review this data for {state.get('user_prompt')}.
-        Clean Evidence: {json.dumps(state.get('gathered_evidence'))}
-        
-        First, speak as a MOLECULAR PATHOLOGIST: Evaluate the tissue context. CRITICAL: Compare the gene's "normal_tissue_gtex" and HPA Single-Cell data against the {state.get('user_prompt')} context. Flag any lineage artifacts or stromal/immune admixture.
-        Second, speak as a MEDICAL ONCOLOGIST: Evaluate the OpenTargets Tractability and DepMap Essentiality data. Is this a viable drug target?
-        Third, speak as a BIOINFORMATICS AUDITOR: Audit the PubMed literature for Acronym Collisions. Name any disconnected papers and command the Medical Writer to ignore them.
-        """
-        
+    prompt = f"""
+    You are hosting a clinical tumor board. Review this preliminary data for {state.get('user_prompt')}.
+    Clean Evidence: {json.dumps(state.get('gathered_evidence'))}
+    Pathways: {json.dumps(state.get('pathway_data'))}
+    
+    First, speak as a MOLECULAR PATHOLOGIST: In 1 paragraph, evaluate the tissue context and biological plausibility. CRITICAL SANITY CHECK: You MUST explicitly compare the gene's "normal_tissue_gtex" profile (found in the Clean Evidence) against the user's specified Cancer Type. If the gene is a canonical marker for a completely different tissue type (e.g., a pancreas gene in a melanoma sample), you MUST flag this as a probable lineage artifact or sample contamination.
+    Second, speak as a MEDICAL ONCOLOGIST: In 1 paragraph, evaluate the druggability and clinical trial viability. You MUST explicitly reference the OpenTargets Tractability and DepMap Essentiality data provided in the Clean Evidence to justify your assessment. If the Pathologist flags a tissue mismatch, advise extreme caution regarding clinical utility.
+    Third, speak as a BIOINFORMATICS AUDITOR: In 1 paragraph, audit the PubMed literature for Acronym Collisions. (e.g., if the gene symbol is 'CEL' but the abstract is talking about 'CEL cells' or 'Celastrol', or 'PPL' meaning a polymer). If you detect a collision or biologically disconnected paper, explicitly name it and command the Medical Writer to ignore it.
+    """
     response = llm.invoke([HumanMessage(content=prompt)])
     return {"expert_consensus": response.content}
 
 def writer_node(state: AgentState):
     st.markdown("✍️ [NODE: Writer] Synthesizing the final clinical report...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
-
-    # --- Inject TME Deconvolution Context ---
-    tme_data = state.get("tme_deconvolution", {})
-    tme_context_str = "TME Deconvolution was not run by the user."
     
-    if tme_data and not tme_data.get("error"):
-        all_fractions = pd.DataFrame([d["fractions"] for d in tme_data["metrics"].values()])
-        avg_r2 = np.mean([d["r_squared"] for d in tme_data["metrics"].values()])
-        
-        # Rigorous Fix: Calculate mean AND maximum variance to expose heterogeneity to the LLM
-        tme_summary = all_fractions.describe().T
-        
-        tme_context_str = f"Cohort TME Profile (Algorithm Fit R-Squared: {avg_r2:.2f}):\n"
-        for cell in tme_summary.index:
-            mean_val = tme_summary.loc[cell, 'mean']
-            max_val = tme_summary.loc[cell, 'max']
-            if max_val > 0.05:  # Only report if it peaks above 5% in at least one patient
-                tme_context_str += f"- {cell}: Mean {mean_val * 100:.1f}% (Peak Heterogeneity Max: {max_val * 100:.1f}%)\n"
+    analysis_mode = state.get("analysis_mode", "Clinical Triage")
     
-    intent = state.get("biomarker_intent", "Therapeutic Target (Drug Discovery)")
-    
-    if "Diagnostic" in intent:
-        sys_msg = f"""You are an expert Clinical Pathologist and Diagnostics Architect.
-        Write a precise, clinically rigorous report evaluating these targets specifically as screening, diagnostic, or prognostic biomarkers. 
-        DO NOT discuss druggability, OpenTargets, or therapeutics. Focus ONLY on detectability and spatial biology.
+    if "Discovery" in analysis_mode:
+        sys_msg = """You are an expert Systems Biologist and Bioinformatics AI.
+        Write a beautiful, pathway-centric scientific report answering the user's prompt. 
         
         CRITICAL GUARDRAILS:
-        1. THE ARTIFACT KILLER: Explicitly reference the Human Protein Atlas (HPA) single-cell data. 
-        2. TME DECONVOLUTION MAPPING: Review the following cohort TME profile:
-        {tme_context_str}
-        If the HPA single-cell data flags a gene as belonging to a specific immune/stromal cell (e.g., Macrophages), AND that same cell type shows high variance or abundance in the TME profile above, you MUST explicitly state that the gene's expression is merely a proxy for immune infiltration, not a tumor-intrinsic driver.
-        3. DETECTABILITY TRIAGE: You MUST explicitly reference the 'Detectability' secretome data. Classify targets based on their ability to be detected non-invasively.
-        
-        REQUIRED REPORT STRUCTURE:
-        ## 📊 Diagnostic Executive Summary
-        [Write a concise 3-4 sentence high-level overview explaining why these specific targets were selected. Summarize the best candidate for non-invasive detection.]
-        
-        ## 🩸 Clinical Detection Tiers
-        [Synthesize the evidence and categorize each evaluated gene into one of the following Tiers based strictly on its HPA Detectability profile:]
-        
-        * **🟢 Tier 1: Liquid Biopsy Candidates (High Detectability)**: Secreted or plasma protein, ideal for ELISA.
-        * **🟡 Tier 2: Shed/Surface Biomarkers (Moderate Detectability)**: Membrane protein. May require flow cytometry/CTCs.
-        * **🟠 Tier 3: Tissue-Restricted Biomarkers (Low Detectability)**: Intracellular. Requires invasive biopsy.
-        * **🔴 Tier 4: Confounding Artifacts (Do Not Pursue)**: The target is a proven immune/stromal admixture artifact based on the TME Deconvolution Mapping.
-        
-        [Discuss each gene under its appropriate Tier header.]
-        
-        ## 🏥 Diagnostic Validation & Survival Outcomes
-        [Summarize how these biomarkers stratify patient risk. CRITICAL: Explicitly state if 'Survival_Outcomes' evidence indicates "Unfavorable" or "Favorable" prognosis.]
-        
-        ### 🧪 Recommended Next Validation Steps
-        [Provide 3-4 bullet points. CRITICAL: Explicitly provide validated antibody catalog numbers from the "IHC_Antibodies" evidence for spatial validation.]
-        """
-    else:
-        # --- Modality Awareness for the Writer ---
-        modality = state.get("therapeutic_modality", "Small Molecule / Kinase Inhibitor")
-        
-        sys_msg = f"""You are an expert Systems Biologist and Bioinformatics AI.
-        Write a beautiful, pathway-centric scientific report evaluating these genes as drug targets. 
-        Your strategic focus for target evaluation is: {modality}.
-        
-        CRITICAL GUARDRAILS:
-        1. TONE AND STYLE: Write confidently as if authoring a published review article.
-        2. BIOLOGICAL TRIAGE: Explicitly dismiss pseudogenes and ncRNAs.
-        3. ACRONYM COLLISIONS: Be highly aware of literature false-positives.
+        1. TONE AND STYLE: Write confidently as if authoring a published review article in a high-impact oncology journal. NEVER break the fourth wall (do not say "The user provided" or "The AI found"). Use bullet points occasionally to break up dense mechanistic explanations. Use **bold text** for gene names.
+        2. BIOLOGICAL TRIAGE: Explicitly dismiss pseudogenes and ncRNAs as non-coding artifacts.
+        3. ACRONYM COLLISIONS & LITERATURE LIMITATIONS: Be highly aware of literature false-positives. If PubMed returns acronym collisions or papers that only discuss network neighbors (and not the primary target), weave this critique naturally into your academic prose (e.g., "While some literature attributes X to Y, this largely reflects confounding nomenclature..." or "Current evidence is restricted to proximal network nodes rather than direct target validation..."). Do NOT use robotic sub-headers like "Sanity Check".
         4. SYSTEMS APPROACH: Discuss genes conceptually within their pathways.
-        5. GUILT BY ASSOCIATION: If a target lacks direct literature, evaluate its STRING interactors.
-        6. TISSUE CONTEXT: Flag lineage mismatches.
-        7. POPULATION FEASIBILITY: Mention the cBioPortal/TCGA alteration frequency. 
-        8. THE ARTIFACT KILLER & TME MAPPING: Review the following cohort TME profile:
-        {tme_context_str}
-        If the HPA single-cell data flags a gene as belonging to Macrophages, Kupffer cells, T-cells, or Adipocytes, AND that cell type shows high variance or abundance in the TME profile above, you MUST explicitly state that the gene's expression is merely a proxy for immune infiltration (Tissue Admixture Artifact), not a tumor-intrinsic driver. Place it in Tier 4.
+        5. GUILT BY ASSOCIATION: If a target lacks direct literature or tractability, evaluate its "STRING_Interactions". Propose backdoor therapeutic strategies using its direct neighbors.
+        6. TISSUE CONTEXT: If the Expert Consensus flags lineage mismatches (e.g., breast genes in melanoma, or stromal admixture), state this clearly once in the executive summary, and frame the rest of the report around resolving this spatial uncertainty.
         
         REQUIRED REPORT STRUCTURE:
         ## 📊 Executive Summary
-        [Write a concise 3-4 sentence high-level overview explaining why these targets were selected for {modality} development. Explicitly mention the Tumor Microenvironment composition if relevant.]
+        [Write a concise 3-4 sentence high-level overview. YOU MUST START by explicitly explaining to the reader WHY these specific genes were selected (e.g., "These targets were autonomously selected because they are the primary drivers of the [Insert Top KEGG Pathway Here] cluster identified in the patient's differential expression profile.") Then summarize actionable next steps.]
         
         ## 🕸️ Systems Biology & Pathway Dysregulation
-        [Write a multi-paragraph synthesis of the KEGG pathway data.]
+        [Write a multi-paragraph synthesis of the KEGG pathway data. How do these networks (and their overlapping genes) interact to drive the tumor microenvironment, metabolic reprogramming, or immune evasion?]
         
         ## 🔬 Targetable Hubs & Translational Risk Tiers
-        [Synthesize the literature conceptually, categorizing each evaluated gene based strictly on OpenTargets Tractability, DepMap Essentiality, and your Modality focus. If Modality is CAR-T/ADC, emphasize cell-surface tractability over essentiality:]
+        [Synthesize the literature conceptually, but you MUST categorize each evaluated gene into one of the following Translational Risk Tiers based strictly on its OpenTargets Tractability and DepMap Essentiality data:]
         
-        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: Highly Druggable AND/OR highly Essential (or ideal surface markers for ADCs).
-        * **🟡 Tier 2: Network Dependencies (Moderate Risk)**: Lacks direct druggability, but its interactors are actionable.
-        * **🟠 Tier 3: Orphan Signals (High Risk)**: Not Tractable, Not Essential. Requires orthogonal validation.
-        * **🔴 Tier 4: Probable Artifacts (Do Not Pursue)**: Pseudogenes, lineage mismatches, acronym collisions, or proven HPA Immune/Stromal artifacts based on the TME Mapping.
+        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: The gene is classified by OpenTargets as highly Druggable (Tractable via Small Molecule, Antibody, or PROTAC) AND/OR it is highly Essential in DepMap CRISPR screens. Ready for translational validation.
+        * **🟡 Tier 2: Network Dependencies (Moderate Risk)**: The gene is biologically relevant but lacks direct OpenTargets druggability (e.g., intracellular and non-essential). However, its STRING interactors or pathways are actionable. Intervene at the network level.
+        * **🟠 Tier 3: Orphan Signals (High Risk)**: The gene is Not Tractable, Not Essential in DepMap, lacks literature, and has no actionable interactors. Highly speculative; requires orthogonal wet-lab validation.
+        * **🔴 Tier 4: Probable Artifacts (Do Not Pursue)**: Pseudogenes, lineage mismatches (e.g., breast genes in melanoma), or acronym collisions.
         
         [Discuss the genes under their appropriate Tier headers.]
         
         ## 🏥 Translational Outlook
-        [Summarize relevant clinical trials.]
+        [Summarize any relevant trials, or state that these novel network targets currently lack specific recruiting trials. Explicitly comment on WHY this biological connection is novel and HOW it is biologically plausible based on the Pathologist/Oncologist consensus.]
         
         ### 🧪 Recommended Next Experimental Steps
-        [Provide 3-4 bullet points. Provide specific HPA antibody catalog numbers for IHC validation. Point them to the Bench-to-Cloud tool below.]
+        [Provide 3-4 bullet points on how a wet-lab researcher should experimentally validate these findings. CRITICAL: Your final bullet point MUST inform the user that they can generate a ready-to-order CRISPR/qPCR Wet-Lab Manifest for any of these targets using the "Bench-to-Cloud Validation Designer" at the bottom of the dashboard.]
         """
+    else:
+        sys_msg = """You are an expert Clinical Oncology Medical Writer.
+        Write a beautiful, multi-paragraph scientific report answering the user's prompt.
+        
+        CRITICAL CLINICAL TRIAGE RULES:
+        1. Standard of Care: Level 1 or 2 evidence.
+        2. Repurposing: Level 3 or 4 evidence.
+        3. Dismiss pseudogenes/ncRNAs using the biology context.
+        
+        REQUIRED REPORT STRUCTURE:
+        First, provide a brief summary of the overarching biological pathways driving this tumor:
+        ### 🕸️ Pathway & Network Dysregulation
+        - [Write a 2-3 sentence summary based on the KEGG pathway_data provided. Mention the overlapping genes.]
+        
+        Then, for EVERY gene sequentially, use this exact structure:
+        ## [Gene Name] ([Alteration])
+        
+        ### 🎯 Target Tractability & Essentiality (OpenTargets)
+        [CRITICAL: If the OpenTargets status indicates 'ZERO tractability' or 'not found', you MUST explicitly write: "OpenTargets was queried but currently holds no tractability or essentiality data for this target."]
+        - **Druggability:** [Summarize modality buckets, or state none]
+        - **Essentiality:** [State if it is essential in DepMap screens, or state none]
+        - **Structural Vulnerability:** [CRITICAL: Check the 'UniProt_Pockets' data. Explicitly state if the target has defined druggable active sites/pockets, or if it lacks them.]
 
+        ### 💊 OncoKB Therapeutics
+
+        ### 💊 OncoKB Therapeutics
+        - **Standard of Care (On-Label):** [Drug Name] (PMIDs: [List])
+        - **Repurposing Opportunities (Off-Label):** [Drug Name] (PMIDs: [List])
+        
+        ### 🔬 Experimental Literature
+        - **[Study Topic]:** [Summary] (PMID: [Number])
+        
+        ### 🏥 Actively Recruiting Trials
+        - **[[NCT ID]](https://clinicaltrials.gov/study/[NCT ID]):** [Phase] - [Trial Title]
+        
+        Do not deviate from this structure."""
+    
     user_context = f"User Prompt: {state.get('user_prompt')}\nPathway Data: {json.dumps(state.get('pathway_data', {}))}\nExpert Consensus: {state.get('expert_consensus')}\nGathered Evidence: {json.dumps(state.get('gathered_evidence'))}\nCustom Lab Protocols: {state.get('custom_knowledge', 'None provided.')}"
     
     response = llm.invoke([
@@ -1463,29 +927,19 @@ def writer_node(state: AgentState):
 
 workflow = StateGraph(AgentState)
 workflow.add_node("planner", planner_node)
-workflow.add_node("fast_triage", fast_triage_node)           # <-- NEW
-workflow.add_node("intelligent_selection", intelligent_selection_node) # <-- NEW
 workflow.add_node("executor", executor_node)
-workflow.add_node("clinical_review", clinical_review_node) 
+workflow.add_node("clinical_review", clinical_review_node) # <-- NEW
 workflow.add_node("writer", writer_node)
 
-# --- THE NEW PIPELINE FLOW ---
 workflow.add_edge(START, "planner")
-workflow.add_edge("planner", "fast_triage")
-workflow.add_edge("fast_triage", "intelligent_selection")
-workflow.add_edge("intelligent_selection", "executor")
-# (Executor to Writer is paused via Streamlit HITL as usual)
-
+workflow.add_edge("planner", "executor")
+# We remove the direct edge from executor to writer, because Streamlit HITL handles the pause!
+# The graph just holds the nodes. We call them manually in Streamlit.
 orchestrator = workflow.compile()
 
 # ==========================================
 # STREAMLIT FRONTEND & UI (VERSION 2.0)
 # ==========================================
-# Initialize session state variables so they survive button clicks
-if "volcano_fig" not in st.session_state:
-    st.session_state.volcano_fig = None
-if "ai_targets" not in st.session_state:
-    st.session_state.ai_targets = []
 
 col1, col2 = st.columns([1, 2])
 
@@ -1508,8 +962,8 @@ with col1:
     batch_col = "None"
     
     if metadata_file is not None:
-        # Peek at the metadata columns WITH index_col=0 so it perfectly matches the math engine
-        temp_meta = pd.read_csv(metadata_file, index_col=0, nrows=0) 
+        # Peek at the metadata columns without locking up memory
+        temp_meta = pd.read_csv(metadata_file, nrows=0) 
         meta_cols = temp_meta.columns.tolist()
         
         # CRITICAL FIX: Rewind the file pointer back to the beginning!
@@ -1524,45 +978,52 @@ with col1:
             batch_col = st.selectbox("Batch Covariate (Optional)", ["None"] + meta_cols)
             
     st.markdown("---")
-    st.subheader("3. Statistical Cutoffs")
-    # --- The Engine Selector and Form ---
-    with st.form("stats_form"):
-        de_engine = st.selectbox("Differential Expression Engine", ["PyDESeq2", "EdgePy", "RPKM/T-Test"])
-        pval_thresh = st.number_input("P-Value Cutoff", min_value=0.0001, max_value=0.1000, value=0.0500, step=0.0100, format="%.4f")
-        log2fc_thresh = st.slider("Log2FC Threshold (Absolute)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
+    st.subheader("3. Configuration & Target Roster")
+    
+    # --- Unified Configuration Form ---
+    with st.form(key="target_settings_form"):
+        st.markdown("#### 📈 Statistical Cutoffs")
+        de_engine_input = st.selectbox("Differential Expression Engine", ["PyDESeq2", "RPKM/T-Test"], index=0 if st.session_state.de_engine == "PyDESeq2" else 1)
+        pval_thresh_input = st.number_input("P-Value Cutoff", min_value=0.0001, max_value=0.1000, value=st.session_state.pval_thresh, step=0.0100, format="%.4f")
+        log2fc_thresh_input = st.slider("Log2FC Threshold (Absolute)", min_value=0.0, max_value=10.0, value=st.session_state.log2fc_thresh, step=0.5)
         
-        update_plot_btn = st.form_submit_button("📊 Generate Volcano Plot")
+        st.markdown("#### 🎯 Target Selection Roster")
+        st.write("Configure how many targets the AI should extract from the different biological layers:")
+        col_r1, col_r2, col_r3 = st.columns(3)
+        
+        with col_r1:
+            n_up_input = st.number_input("Upregulated Pathway Drivers", min_value=0, max_value=5, value=st.session_state.n_up_pathway, help="Genes driving the dominant GSEA networks.")
+        with col_r2:
+            n_down_input = st.number_input("Downregulated Biomarkers", min_value=0, max_value=5, value=st.session_state.n_down_pathway, help="Suppressed genes from inverse GSEA networks (Synthetic Lethality).")
+        with col_r3:
+            n_out_input = st.number_input("Lone Wolves (Outliers)", min_value=0, max_value=5, value=st.session_state.n_outliers, help="Highest statistical spikes, regardless of pathway.")
+        
+        submitted = st.form_submit_button("Apply Configuration & Generate Plot")
+        
+    if submitted:
+        # Explicitly bind mutated values to state ONLY when form is submitted to prevent race conditions
+        st.session_state.de_engine = de_engine_input
+        st.session_state.pval_thresh = pval_thresh_input
+        st.session_state.log2fc_thresh = log2fc_thresh_input
+        st.session_state.n_up_pathway = n_up_input
+        st.session_state.n_down_pathway = n_down_input
+        st.session_state.n_outliers = n_out_input
+        
+    # Extract from state for safe downstream usage (retained during unrelated UI rerenders)
+    de_engine = st.session_state.de_engine
+    pval_thresh = st.session_state.pval_thresh
+    log2fc_thresh = st.session_state.log2fc_thresh
+    n_up_pathway = st.session_state.n_up_pathway
+    n_down_pathway = st.session_state.n_down_pathway
+    n_outliers = st.session_state.n_outliers
+    
+    top_n_genes = n_up_pathway + n_down_pathway + n_outliers # Keep total count for downstream logic
+    update_plot_btn = submitted # Map the submit button to the downstream mathematical trigger
 
     st.markdown("---")
     st.subheader("4. Clinical Context & AI Triage")
     cancer_type = st.text_input("Cancer Type (e.g., Melanoma, NSCLC)", value="Melanoma")
-    biomarker_intent = st.radio("Biomarker Goal", ["Therapeutic Target (Drug Discovery)", "Diagnostic/Risk Biomarker (Screening/Monitoring)"])
-    
-    # --- NEW: THERAPEUTIC MODALITY ROUTER ---
-    therapeutic_modality = st.selectbox(
-        "Therapeutic Modality (If applicable)", 
-        ["Small Molecule / Kinase Inhibitor", "CAR-T / ADC / Radioligand"],
-        help="Changes the AI's internal selection weights. CAR-T/ADC modes ignore DepMap essentiality and strictly enforce Cell Surface localization."
-    )
-    
     analysis_mode = st.radio("Analysis Mode", ["Clinical Triage (Known Targets)", "Biomarker Discovery (Novel Targets)"])
-    
-    # --- NEW: AI SCREENING FUNNEL UI (FORM REMOVED FOR LIVE UPDATES) ---
-    st.markdown("#### 🎯 Target Selection Funnel")
-    
-    st.write("**1. The Wide Net:** How many targets should the AI pull from the math engine for fast screening?")
-    col_r1, col_r2, col_r3 = st.columns(3)
-    with col_r1:
-        n_up_pathway = st.number_input("Upregulated Drivers", min_value=0, max_value=30, value=10)
-    with col_r2:
-        n_down_pathway = st.number_input("Downregulated", min_value=0, max_value=30, value=5)
-    with col_r3:
-        n_outliers = st.number_input("Outliers", min_value=0, max_value=30, value=5)
-        
-    st.write("**2. The Deep Dive:** How many of those should survive the funnel for expensive PubMed/RAG analysis?")
-    n_deep_dive = st.slider("Final Candidates (Max)", min_value=1, max_value=10, value=3)
-    
-    top_n_genes = n_up_pathway + n_down_pathway + n_outliers
     
     st.markdown("### 🧑‍⚕️ Clinical Safety & Evidence")
     hitl_toggle = st.toggle("⏸️ Enable Human-in-the-Loop (Review evidence before report generation)", value=True)
@@ -1574,7 +1035,19 @@ with col1:
     else:
         btn_text = "🚀 Run Full AI Clinical Triage"
         
-    run_button = st.button(btn_text, width="stretch", type="primary")
+    # --- PHASE 2: UI GUARD LOGIC ---
+    # Check if PyDESeq2/T-Test data has been successfully generated
+    data_ready = not st.session_state.upregulated_df.empty
+    
+    if not data_ready:
+        st.info("⚠️ Please upload your data and click 'Generate Volcano Plot' first to populate actionable targets.")
+        
+    run_button = st.button(
+        btn_text, 
+        use_container_width=True, 
+        type="primary",
+        disabled=not data_ready # Physically lock the button to prevent out-of-order execution!
+    )
     
     # --- NEW RAG UI ---
     st.markdown("---")
@@ -1582,128 +1055,10 @@ with col1:
     uploaded_pdf = st.file_uploader("Upload Lab Protocols/Guidelines (PDF)", type=["pdf"])
 
 with col2:
-    # --- UI FIX: Headers are now permanently visible as placeholders ---
-    st.subheader("1. PCA Quality Control (QC) Gate")
-    pca_container = st.container() # We will render PCA inside here later
+    st.subheader("Interactive Volcano Plot")
     
-    st.markdown("---")
-    st.subheader("2. Tumor Microenvironment (TME) Deconvolution")
-    tme_container = st.container() # We will render TME inside here later
-    
-    st.markdown("---")
-    st.subheader("3. Interactive Volcano Plot")
-    volcano_container = st.container() # We will render Volcano inside here later
-
-    # --- NOW WE RUN THE MATH IF FILES ARE UPLOADED ---
-    if counts_file and metadata_file:
-        counts_df_raw = pd.read_csv(counts_file, index_col=0)
-        metadata_df_raw = pd.read_csv(metadata_file, index_col=0)
-        
-        with pca_container:
-            st.info("Visually inspect your samples before running differential expression. Outliers or batch effects will appear as disconnected dots.")
-            with st.spinner("Calculating Principal Components..."):
-                pca_data = counts_df_raw  
-                scaler = StandardScaler()
-                scaled_data = scaler.fit_transform(pca_data)
-                
-                pca = PCA(n_components=2)
-                pca_results = pca.fit_transform(scaled_data)
-                
-                pca_df = pd.DataFrame(data=pca_results, columns=['PC1', 'PC2'], index=pca_data.index)
-                pca_df = pca_df.join(metadata_df_raw, how='inner').reset_index() 
-                
-                var_exp = pca.explained_variance_ratio_ * 100
-                plot_symbol = batch_col if batch_col != "None" and batch_col in pca_df.columns else None
-                
-                pca_fig = px.scatter(
-                    pca_df, x='PC1', y='PC2', 
-                    color=condition_col if condition_col in pca_df.columns else None, 
-                    symbol=plot_symbol,
-                    hover_name=pca_df.columns[0],
-                    title="Patient Sample Clustering (PCA)",
-                    labels={'PC1': f"PC1 ({var_exp[0]:.1f}% Variance)", 'PC2': f"PC2 ({var_exp[1]:.1f}% Variance)"},
-                    color_discrete_sequence=px.colors.qualitative.Set1
-                )
-                pca_fig.update_traces(marker=dict(size=10, line=dict(width=1, color='DarkSlateGrey')))
-                pca_fig.update_layout(height=400)
-                st.plotly_chart(pca_fig, width="stretch")
-
-       # Run TME Deconvolution and render the dashboard with findings and narrative
-        with tme_container:
-            st.info("🚀 **Strategy:** Utilizing Hierarchical Sentinel Unmixing to identify TME shifts.")
-            
-            # Initialize session state for TME results if it doesn't exist
-            if 'tme_analysis_complete' not in st.session_state:
-                st.session_state.tme_analysis_complete = False
-                st.session_state.tme_results = None
-                st.session_state.tme_stats = None
-
-            # The one button that triggers the entire engine
-            if st.button("🧬 Run Rigorous TME Analysis", type="primary", width="stretch"):
-                with st.spinner("Deconvolving TME Axes..."):
-                    try:
-                        # IMPORT OUR NEW MODULES
-                        from tme_core import TMECore
-                        from dashboard_components import render_tme_dashboard
-                        
-                        # EXECUTE MATH ENGINE
-                        engine = TMECore(counts_df_raw, metadata_df_raw)
-                        results, stats = engine.run_analysis()
-                        
-                        # STORE IN SESSION STATE
-                        st.session_state.tme_results = results
-                        st.session_state.tme_stats = stats
-                        st.session_state.tme_analysis_complete = True
-                        
-                    except Exception as e:
-                        st.error(f"❌ TME Engine Error: {str(e)}")
-                        st.warning("Ensure 'final_hierarchy_markers.csv' and your data files are in the working directory.")
-                        st.session_state.tme_analysis_complete = False
-
-            # Render UI only if state is active (survives UI reruns)
-            if st.session_state.get('tme_analysis_complete'):
-                from dashboard_components import render_tme_dashboard
-                
-                results = st.session_state.tme_results
-                stats = st.session_state.tme_stats
-                
-                # RENDER DASHBOARD (Plotly Boxplots + Rigor Badges)
-                # Ensure render_tme_dashboard handles empty stats DataFrames gracefully
-                key_finding, risk_col_name = render_tme_dashboard(results, stats)
-                
-                # RENDER AGENT NARRATIVE
-                st.markdown("---")
-                st.subheader("🤖 Agent Narrative & Clinical Synthesis")
-                
-                with st.chat_message("assistant"):
-                    if key_finding is not None and not stats.empty:
-                        best_p = float(key_finding.get('P_Value', 1.0))
-                        cell_type = key_finding.get('Cell_Type', 'Unknown')
-                        avg_r2 = results['R2'].mean() if 'R2' in results.columns else 0.0
-                        
-                        context = f"""
-                        Analysis of {len(results)} samples complete.
-                        Detected Group Comparison: {risk_col_name}.
-                        Primary discovery: {cell_type} is a significant driver (p={best_p:.2e}).
-                        Stability Metrics: Average R2={avg_r2:.2f}.
-                        """
-                        
-                        if best_p < 0.05:
-                            st.write(f"My analysis confirms a **statistically significant shift** in the {cell_type} population.")
-                            st.write(f"Mathematically, this is a robust finding, suggesting that the {cell_type} fraction is a reliable sentinel for disease progression in this cohort.")
-                        else:
-                            st.write("I have processed the TME axes, but no single cell type reached the threshold of statistical significance ($p < 0.05$). This suggests the cohorts are TME-homogenous.")
-                    else:
-                        st.write("I successfully deconvolved the data, but no statistical groups were detected in your metadata to perform comparative analysis.")
-
-    # --- VOLCANO PLOT SECTION ---
-
     # Only run the heavy math if files are uploaded AND the update button was clicked
     if counts_file and metadata_file and update_plot_btn:
-        # --- FIX: Rewind the file pointers after the PCA read them! ---
-        counts_file.seek(0)
-        metadata_file.seek(0)
-        
         counts_df = pd.read_csv(counts_file, index_col=0)
         metadata_df = pd.read_csv(metadata_file, index_col=0)
         
@@ -1723,44 +1078,64 @@ with col2:
             
             mock_active = st.session_state.get("use_mock_mode", False)
 
+            # --- 1. DATA VALIDATION & ALIGNMENT GATEKEEPER ---
+            is_transposed = False
+            # Standard RNA-seq data often has genes as rows and samples as columns.
+            # PyDESeq2 strictly expects samples as rows and genes as columns.
+            if set(metadata_df.index).issubset(set(counts_df.columns)):
+                counts_df = counts_df.T
+                is_transposed = True
+                
+            # Assert exact matching after potential transposition
+            try:
+                assert set(metadata_df.index).issubset(set(counts_df.index)), "Sample IDs in metadata do not match counts matrix."
+            except AssertionError as e:
+                st.error(f"🚨 Data Alignment Error: {str(e)}. Please check your CSV files.")
+                st.stop()
+                
+            # Align and subset counts to match metadata order perfectly
+            counts_df = counts_df.loc[metadata_df.index]
+            
+            # --- 2. DATA TYPE SAFETY ---
+            # PyDESeq2 strictly requires integer matrices. Handle NaNs and floats safely.
+            counts_df = counts_df.fillna(0).round().astype(int)
+            
+            # Remove zero-variance genes to prevent math convergence failures
+            counts_df = counts_df.loc[:, counts_df.var(axis=0) > 0]
+
             # --- THE OVERRIDE ---
             if mock_active:
-                output = run_differential_stats(counts_df, metadata_df, condition_col, level_1, level_2, mock_mode=True)
+                fallback_counts = counts_df.T if is_transposed else counts_df
+                output = run_differential_stats(fallback_counts, metadata_df, condition_col, level_1, level_2, mock_mode=True)
                 results_df = output["results_df"]
             else:
                 if de_engine == "PyDESeq2":
-                    # --- Updated PyDESeq2 logic with covariates ---
-                    dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors=design_factors)
-                    dds.deseq2()
-                    stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2])
-                    stat_res.summary()
-                    results_df = stat_res.results_df
-                    
-                elif de_engine == "EdgePy":
-                    # 1. Build the Design Matrix with optional batch effect
-                    design = dmatrix(edge_formula, data=metadata_df)
-                    
-                    # 2. Initialize the EdgePy DGEList
-                    dge_list = DGEList(counts=counts_df, samples=metadata_df, group_col=condition_col, genes=counts_df.index)
-                    
-                    # 3. Fit the Generalized Linear Model (GLM)
-                    fit = glmFit(dge_list, design=design)
-                    
-                    # 4. Run the Likelihood Ratio Test (LRT) for the 'condition' variable
-                    lrt = glmLRT(fit)
-                    
-                    # 5. Extract and format the results to match our PyDESeq2 shape
-                    # InMoose outputs pandas dataframes just like PyDESeq2!
-                    res = lrt.table
-                    results_df = pd.DataFrame(index=res.index)
-                    results_df['log2FoldChange'] = res['logFC']
-                    results_df['padj'] = res['FDR'] # EdgeR uses FDR instead of padj
-
+                    try:
+                        # --- Updated PyDESeq2 logic with covariates and Windows Deadlock Guard (n_cpus=1) ---
+                        dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors=design_factors, n_cpus=1)
+                        dds.deseq2()
+                        stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2], n_cpus=1)
+                        stat_res.summary()
+                        results_df = stat_res.results_df
+                    except Exception as e:
+                        # --- 3. DEFENSIVE MATH EXECUTION (FALLBACK) ---
+                        st.warning(f"⚠️ PyDESeq2 Math Convergence Error: {str(e)}. Automatically falling back to robust T-Test Engine...")
+                        fallback_counts = counts_df.T if is_transposed else counts_df
+                        output = run_differential_stats(
+                            counts_df=fallback_counts,
+                            metadata_df=metadata_df,
+                            condition_col=condition_col,
+                            test_cond=level_1,
+                            ctrl_cond=level_2,
+                            mock_mode=False
+                        )
+                        results_df = output["results_df"]
+                        
                 elif de_engine == "RPKM/T-Test":
                     # --- PRODUCTION RPKM T-TEST PIPELINE ---
-                    # (Mock mode is handled by the override above)
+                    fallback_counts = counts_df.T if is_transposed else counts_df
                     output = run_differential_stats(
-                        counts_df=counts_df,
+                        counts_df=fallback_counts,
                         metadata_df=metadata_df,
                         condition_col=condition_col,
                         test_cond=level_1,
@@ -1808,9 +1183,13 @@ with col2:
         
         st.session_state.volcano_fig = fig # Save plot to memory
         
+        # --- PHASE 3 FIX: FORCE UI SYNC ---
+        # Instantly flush the state and redraw the UI so the AI execution button unlocks immediately
+        st.rerun()
+        
     # Always display the plot if it exists in memory, even if they clicked a different button!
     if st.session_state.volcano_fig:
-        st.plotly_chart(st.session_state.volcano_fig, width="stretch")
+        st.plotly_chart(st.session_state.volcano_fig, use_container_width=True)
         
         if len(st.session_state.ai_targets) > 0:
             formatted_genes = ", ".join([f"`{gene}`" for gene in st.session_state.ai_targets])
@@ -2024,19 +1403,13 @@ if run_button and counts_file and metadata_file:
             "significant_genes": structured_genes,
             "plan": [],
             "gathered_evidence": [],
-            "pathway_data": pathway_results, 
+            "pathway_data": pathway_results, # <-- NEW: Pass the pre-calculated cluster data!
             "final_report": "",
             "custom_knowledge": rag_context, 
             "analysis_mode": analysis_mode,
-            "biomarker_intent": biomarker_intent,  
-            "therapeutic_modality": therapeutic_modality, # <--- NEW
-            "max_deep_dive": n_deep_dive,          
-            "fast_triage_data": [],               # <--- ADD THIS
-            "selection_logic": "",                # <--- ADD THIS
             "discarded_evidence": [], 
             "ai_filtered_evidence": [],
-            "expert_consensus": "",
-            "tme_deconvolution": st.session_state.get("vvuq_results", {})
+            "expert_consensus": ""
         }
         
         # Save settings for the Vanilla Baseline execution
@@ -2048,16 +1421,7 @@ if run_button and counts_file and metadata_file:
         st.session_state.agent_state = initial_state
         
         with get_openai_callback() as cb:
-            # 1. Plan the attack
             st.session_state.agent_state.update(planner_node(st.session_state.agent_state))
-            
-            # 2. NEW: The Fast Funnel (Screens all 20 genes cheaply)
-            st.session_state.agent_state.update(fast_triage_node(st.session_state.agent_state))
-            
-            # 3. NEW: The AI Judge (Filters down to the max limit)
-            st.session_state.agent_state.update(intelligent_selection_node(st.session_state.agent_state))
-            
-            # 4. The Deep Dive (ONLY runs on the winners!)
             st.session_state.agent_state.update(executor_node(st.session_state.agent_state))
             
             # Accumulate the costs
@@ -2121,7 +1485,7 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
         edited_df = st.data_editor(
             df_papers[["Keep", "Score (1-10)", "AI Reason", "Gene", "Title", "PMID"]], 
             hide_index=True, 
-            width="stretch",
+            use_container_width=True,
             disabled=["Score (1-10)", "AI Reason", "Gene", "PMID", "Title"] 
         )
     else:
@@ -2136,7 +1500,7 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
                 st.markdown(f"- **{doc['Gene']}** (Score: {doc['Score']}): *{doc['Title']}* - Reason: `{doc['Reason']}`")
         
     # --- THE FINAL TRIGGER ---
-    if st.button("🚀 Step 2: Approve Evidence & Synthesize Report", type="primary", width="stretch"):
+    if st.button("🚀 Step 2: Approve Evidence & Synthesize Report", type="primary", use_container_width=True):
         with st.markdown("✍️ **[NODE: Writer]** Synthesizing the final clinical report..."):
             approved_evidence = copy.deepcopy(st.session_state.agent_state["gathered_evidence"])
             discarded_papers = [] # <-- NEW: Temporary list for trash
@@ -2204,15 +1568,8 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
 if st.session_state.run_complete:
     st.markdown("---")
     st.subheader("📈 Gene Expression Volcano Plot")
-    st.plotly_chart(st.session_state.volcano_fig, width="stretch", key="bottom_volcano_plot")
+    st.plotly_chart(st.session_state.volcano_fig, use_container_width=True, key="bottom_volcano_plot")
     
-    # --- NEW: PERMANENT FUNNEL TRANSPARENCY ---
-    selection_logic = st.session_state.agent_state.get("selection_logic", "")
-    if selection_logic:
-        with st.expander("⚖️ View AI Funnel Selection Logic (DR.KNOWS)", expanded=True):
-            st.info("The AI evaluated all targets from the Wide Net using fast APIs and drafted the top candidates based on the following logic paths:")
-            st.markdown(selection_logic)
-            
     with st.expander("🔍 View the AI's Strategic Plan"):
         for step in st.session_state.plan:
             st.write(f"- {step}")
@@ -2248,7 +1605,7 @@ if st.session_state.run_complete:
                 textfont=dict(color='white'),
                 hovertemplate="<b>%{y}</b><br>Score: %{x:.2f}<br>Genes: %{text}<extra></extra>"
             )
-            st.plotly_chart(pw_fig, width="stretch")
+            st.plotly_chart(pw_fig, use_container_width=True)
             # --- NEW: GSEA MOUNTAIN PLOTS ---
             gsea_obj = st.session_state.get("gsea_obj")
             if gsea_obj:
@@ -2406,7 +1763,7 @@ if st.session_state.run_complete:
             data=styled_html,
             file_name=f"{cancer_type}_Clinical_Report.html",
             mime="text/html",
-            width="stretch"
+            use_container_width=True
         )
         
     with col_down2:
@@ -2415,7 +1772,7 @@ if st.session_state.run_complete:
             data=doc_buffer,
             file_name=f"{cancer_type}_Clinical_Report.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            width="stretch"
+            use_container_width=True
         )
 
 # --- MULTI-MODAL VISUAL ANALYTICS DASHBOARD ---
@@ -2425,8 +1782,8 @@ if st.session_state.run_complete:
     
     if st.session_state.get("ai_targets"):
         # 1. Global Target Selector
-        viz_target = st.selectbox("🎯 Select Target to Analyze:", st.session_state.ai_targets)
-        analyze_btn = st.button("Generate Dual Visualization", type="primary", width="stretch")
+        viz_target = st.selectbox("🎯 Select Target to Analyze:", st.session_state.ai_targets, key="viz_target_selector")
+        analyze_btn = st.button("Generate Dual Visualization", type="primary", use_container_width=True, key="viz_analyze_btn")
         
         if analyze_btn:
             # 2. Side-by-Side Layout
@@ -2487,7 +1844,7 @@ if st.session_state.run_complete:
         
         with b2c_col1:
             lab_target = st.selectbox("🧬 Select Target for Wet-Lab:", st.session_state.ai_targets, key="lab_select")
-            design_btn = st.button("Generate Lab Manifest", type="primary", width="stretch")
+            design_btn = st.button("Generate Lab Manifest", type="primary", use_container_width=True)
             
         with b2c_col2:
             if design_btn:
@@ -2501,11 +1858,11 @@ if st.session_state.run_complete:
                     st.markdown("#### ✂️ CRISPR-Cas9 sgRNA Designs")
                     st.warning("⚠️ **Clinical Disclaimer:** These sequences are AI-generated for structural planning. You MUST verify them against the human reference genome using Benchling or IDT before ordering.")
                     sgrna_df = pd.DataFrame(manifest['sgrnas'])
-                    st.dataframe(sgrna_df, width="stretch", hide_index=True)
+                    st.dataframe(sgrna_df, use_container_width=True, hide_index=True)
                     
                     st.markdown("#### 🧬 qPCR Validation Primers")
                     primer_df = pd.DataFrame(manifest['primers'])
-                    st.dataframe(primer_df, width="stretch", hide_index=True)
+                    st.dataframe(primer_df, use_container_width=True, hide_index=True)
                     
                     # --- THE EXPORT IMPROVEMENT ---
                     st.markdown("#### 📥 Export to Vendor")
@@ -2524,7 +1881,7 @@ if st.session_state.run_complete:
                         data=export_df.to_csv(index=False).encode('utf-8'),
                         file_name=f"{lab_target}_WetLab_Manifest.csv",
                         mime="text/csv",
-                        width="stretch"
+                        use_container_width=True
                     )
                 else:
                     st.error("AI failed to generate a valid manifest. Please try again.")
