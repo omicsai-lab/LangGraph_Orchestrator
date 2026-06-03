@@ -850,9 +850,9 @@ def clinical_review_node(state: AgentState):
 
 def writer_node(state: AgentState):
     st.markdown("✍️ **[NODE: Writer]** Synthesizing the final clinical report...")
-    llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.2, api_key=openai_key)
 
-    # --- 1. INJECT TME CONTEXT ---
+    # --- 1. THE NEW TME MATH CONTEXT ---
     tme_data = state.get("tme_deconvolution", {})
     tme_context_str = "TME Deconvolution was not run by the user."
     
@@ -864,121 +864,61 @@ def writer_node(state: AgentState):
         tme_context_str = f"Cohort TME Profile (Algorithm Fit R-Squared: {avg_r2:.2f}):\n"
         for cell in tme_summary.index:
             max_val = tme_summary.loc[cell, 'max']
-            # FIX: Check against 5.0 (since it's already 0-100), and remove the * 100 multiplication
-            if max_val > 5.0: 
+            if max_val > 5.0:  # Normalized to 100 scale!
                 tme_context_str += f"- {cell}: Mean {tme_summary.loc[cell, 'mean']:.1f}% (Peak Heterogeneity Max: {max_val:.1f}%)\n"
 
     intent = state.get("biomarker_intent", "Therapeutic Target (Drug Discovery)")
     
-    # --- 2. ASSEMBLE THE DATA PAYLOAD (Data goes to the Human Message) ---
-    # Extract only the winning genes that survived the fast triage funnel
+    # --- 2. ASSEMBLE THE DATA PAYLOAD ---
     winning_genes = [g.get('gene') for g in state.get('gathered_evidence', [])]
     winning_genes_str = ", ".join(winning_genes) if winning_genes else "None"
 
     user_context = f"""
     Disease Target: {state.get('user_prompt')}
     
-    You must use the exact markdown headers (## and ###) provided below to ensure the UI renders correctly.
-    
     IMPORTANT CONTEXT: The AI Triage Funnel evaluated a large list of dysregulated genes, but strictly selected ONLY the following candidates for Deep-Dive Evidence Gathering: [{winning_genes_str}]. 
-    You MUST focus your report EXCLUSIVELY on these surviving candidates based on the evidence below. Do not mention or complain about missing evidence for other genes.
+    You MUST focus your report EXCLUSIVELY on these surviving candidates based on the evidence below. Do not mention missing evidence for other genes.
     
     TME Profile: {tme_context_str}
     Pathway Data: {json.dumps(state.get('pathway_data', {}))}
-    Expert Consensus: {state.get('expert_consensus')}
+    Expert Consensus (Tumor Board): {state.get('expert_consensus')}
     Gathered Evidence: {json.dumps(state.get('gathered_evidence'))}
     """
 
-    # --- 3. THE SPLIT PROMPT ARCHITECTURE ---
-    if "Diagnostic" in intent:
-        sys_msg = f"""You are an expert Clinical Pathologist and Diagnostics Architect.
-        Write a precise, clinically rigorous report evaluating these targets specifically as screening, diagnostic, or prognostic biomarkers. 
-        DO NOT discuss druggability, OpenTargets, or therapeutics. Focus ONLY on detectability and spatial biology.
-        
-        CRITICAL GUARDRAILS:
-        1. THE ARTIFACT KILLER: Explicitly reference the Human Protein Atlas (HPA) single-cell data. 
-        2. TME DECONVOLUTION MAPPING: Review the following cohort TME profile:
-        {tme_context_str}
-        If the HPA single-cell data flags a gene as belonging to an immune/stromal cell, AND that cell type shows high variance/abundance in the TME profile, explicitly state that the gene is a proxy for immune infiltration, not a tumor driver.
-        3. DETECTABILITY TRIAGE: Explicitly reference the 'Detectability' secretome data. Classify targets based on non-invasive detection feasibility.
-        4. SURVIVAL OUTCOMES: Explicitly state if evidence indicates "Unfavorable" or "Favorable" prognosis.
+    # --- 3. THE OLD "GOLD STANDARD" PROMPT + NEW TME RULES ---
+    modality = state.get("therapeutic_modality", "Small Molecule / Kinase Inhibitor")
+    sys_msg = f"""You are an expert Systems Biologist and Medical Writer.
+    Write a pathway-centric scientific report evaluating these genes as drug targets for: {modality}.
+    
+    CRITICAL GUARDRAILS:
+    1. TONE AND STYLE: Write confidently as if authoring a published review article.
+    2. THE ARTIFACT KILLER & TME MAPPING: Review the following cohort TME profile:
+    {tme_context_str}
+    If the HPA single-cell data flags a gene as belonging to Macrophages, Kupffer cells, T-cells, or Adipocytes, AND that cell type shows high variance or abundance in the TME profile, explicitly state that the gene is a Tissue Admixture Artifact, not a tumor-intrinsic driver. Place it in Tier 4.
+    
+    YOU MUST STRICTLY USE THE EXACT MARKDOWN TEMPLATE BELOW. DO NOT DEVIATE:
+    
+    ## 📊 Executive Summary
+    [3-4 sentences explaining target selection. Explicitly mention the Tumor Microenvironment composition.]
+    
+    ## 🕸️ Systems Biology & Pathway Dysregulation
+    [Synthesis of the KEGG pathway data]
+    
+    ## 🔬 Targetable Hubs & Translational Risk Tiers
+    [Categorize EACH evaluated gene into its appropriate Tier. Then, for EVERY gene, you MUST provide the following breakdown:]
+    
+    ### [Gene Symbol] - [Tier Assignment]
+    * **🧬 Pathology & Tissue Context:** [Extract the EXACT arguments from the Molecular Pathologist in the Expert Consensus. Explicitly mention the HPA single-cell data and TME admixture risks.]
+    * **💊 Oncology & Actionability:** [Extract the EXACT arguments from the Medical Oncologist/Clinical Chemist. Discuss OpenTargets tractability or DepMap essentiality.]
+    * **📚 Literature Verdict:** [Summarize the Bioinformatics Auditor's findings on PubMed collisions or relevant trials.]
+    
+    ## 🏥 Translational Outlook
+    [Summarize relevant clinical trials and approved drugs]
+    
+    ### 🧪 Recommended Next Experimental Steps
+    [Provide 3-4 bullet points. Provide specific HPA antibody catalog numbers for validation.]
+    """
 
-        YOU MUST STRICTLY USE THE EXACT MARKDOWN TEMPLATE BELOW. DO NOT DEVIATE:
-        
-        ## 📊 Diagnostic Executive Summary
-        [3-4 sentences explaining target selection and spatial biology findings]
-        
-        ## 🔬 Targetable Hubs & Translational Risk Tiers
-        [Categorize EACH evaluated gene into its appropriate Tier. Then, for EVERY gene, you MUST provide the following breakdown:]
-        
-        ### [Gene Symbol] - [Tier Assignment]
-        * **🧬 Pathology & Tissue Context:** [Extract the EXACT arguments from the Molecular Pathologist in the Expert Consensus. Explicitly mention the HPA single-cell data, GTEx tissue distribution, and TME admixture risks.]
-        * **💊 Oncology & Actionability:** [Extract the EXACT arguments from the Medical Oncologist/Clinical Chemist. Discuss OpenTargets tractability, DepMap essentiality, or ELISA detectability.]
-        * **📚 Literature Verdict:** [Summarize the Bioinformatics Auditor's findings on PubMed collisions or relevant trials.]
-        
-        ## 🩸 Clinical Detection Tiers
-        * **🟢 Tier 1: Liquid Biopsy Candidates (High Detectability)**: Secreted or plasma protein, ideal for ELISA.
-        * **🟡 Tier 2: Shed/Surface Biomarkers (Moderate Detectability)**: Membrane protein. May require flow cytometry/CTCs.
-        * **🟠 Tier 3: Tissue-Restricted Biomarkers (Low Detectability)**: Intracellular. Requires invasive biopsy.
-        * **🔴 Tier 4: Confounding Artifacts (Do Not Pursue)**: The target is a proven immune/stromal admixture artifact.
-        
-        [Discuss genes under their appropriate headers]
-        
-        ## 🏥 Diagnostic Validation & Survival Outcomes
-        [Summarize risk stratification and prognostic data]
-        
-        ### 🧪 Recommended Next Validation Steps
-        [Provide 3-4 bullet points. Provide specific HPA antibody catalog numbers for spatial validation.]
-        """
-    else:
-        modality = state.get("therapeutic_modality", "Small Molecule / Kinase Inhibitor")
-        sys_msg = f"""You are an expert Systems Biologist and Bioinformatics AI.
-        Write a beautiful, pathway-centric scientific report evaluating these genes as drug targets for: {modality}.
-        
-        CRITICAL GUARDRAILS:
-        1. TONE AND STYLE: Write confidently as if authoring a published review article.
-        2. BIOLOGICAL TRIAGE: Explicitly dismiss pseudogenes and ncRNAs.
-        3. ACRONYM COLLISIONS: Be highly aware of literature false-positives.
-        4. SYSTEMS APPROACH: Discuss genes conceptually within their pathways.
-        5. GUILT BY ASSOCIATION: If a target lacks direct literature, evaluate its STRING interactors.
-        6. TISSUE CONTEXT: Flag lineage mismatches using HPA data.
-        7. POPULATION FEASIBILITY: Mention the cBioPortal/TCGA alteration frequency. 
-        8. THE ARTIFACT KILLER & TME MAPPING: Review the following cohort TME profile:
-        {tme_context_str}
-        If the HPA single-cell data flags a gene as belonging to Macrophages, Kupffer cells, T-cells, or Adipocytes, AND that cell type shows high variance or abundance in the TME profile, explicitly state that the gene is a Tissue Admixture Artifact, not a tumor-intrinsic driver. Place it in Tier 4.
-        
-        YOU MUST STRICTLY USE THE EXACT MARKDOWN TEMPLATE BELOW. DO NOT DEVIATE:
-        
-        ## 📊 Executive Summary
-        [3-4 sentences explaining target selection. Mention the Tumor Microenvironment composition.]
-        
-        ## 🕸️ Systems Biology & Pathway Dysregulation
-        [Synthesis of the KEGG pathway data]
-        
-        ## 🔬 Targetable Hubs & Translational Risk Tiers
-        [Categorize EACH evaluated gene into its appropriate Tier. Then, for EVERY gene, you MUST provide the following breakdown:]
-        
-        ### [Gene Symbol] - [Tier Assignment]
-        * **🧬 Pathology & Tissue Context:** [Extract the EXACT arguments from the Molecular Pathologist in the Expert Consensus. Explicitly mention the HPA single-cell data, GTEx tissue distribution, and TME admixture risks.]
-        * **💊 Oncology & Actionability:** [Extract the EXACT arguments from the Medical Oncologist/Clinical Chemist. Discuss OpenTargets tractability, DepMap essentiality, or ELISA detectability.]
-        * **📚 Literature Verdict:** [Summarize the Bioinformatics Auditor's findings on PubMed collisions or relevant trials.]
-        
-        ## 🔬 Targetable Hubs & Translational Risk Tiers
-        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: Highly Druggable AND/OR highly Essential (or ideal surface markers for ADCs).
-        * **🟡 Tier 2: Network Dependencies (Moderate Risk)**: Lacks direct druggability, but its interactors are actionable.
-        * **🟠 Tier 3: Orphan Signals (High Risk)**: Not Tractable, Not Essential. Requires orthogonal validation.
-        * **🔴 Tier 4: Probable Artifacts (Do Not Pursue)**: Pseudogenes, lineage mismatches, or proven HPA Immune/Stromal artifacts.
-        
-        [Discuss genes under their appropriate headers]
-        
-        ## 🏥 Translational Outlook
-        [Summarize relevant clinical trials and approved drugs]
-        
-        ### 🧪 Recommended Next Experimental Steps
-        [Provide 3-4 bullet points. Provide specific HPA antibody catalog numbers for validation.]
-        """
-
-    # --- 4. INVOKE THE LLM ---
     response = llm.invoke([
         SystemMessage(content=sys_msg),
         HumanMessage(content=user_context)
@@ -1409,6 +1349,21 @@ if st.session_state.run_complete:
     st.markdown("---")
     st.subheader("📄 Final Synthesized Clinical Report")
     st.markdown(st.session_state.final_report)
+    
+    st.markdown("### 🔍 AI Thought Trace & Funnel Logic")
+    
+    plan = st.session_state.agent_state.get("plan", [])
+    if plan:
+        with st.expander("📋 View the AI's Strategic Plan", expanded=True):
+            st.info("This is the step-by-step roadmap the Planner Agent generated before executing the tool calls.")
+            for step in plan:
+                st.write(f"- {step}")
+
+    selection_logic = st.session_state.agent_state.get("selection_logic", "")
+    if selection_logic:
+        with st.expander("⚖️ View AI Funnel Selection Logic (DR.KNOWS)", expanded=True):
+            st.info("The AI evaluated all targets from the Wide Net using fast APIs and drafted the top candidates based on these logic paths:")
+            st.markdown(selection_logic)
 
     consensus = st.session_state.agent_state.get("expert_consensus", "")
     if consensus:
@@ -1425,6 +1380,13 @@ if st.session_state.run_complete:
                 st.markdown(f"**{g_data['gene']}**")
                 for p in papers: st.markdown(f"- **PMID {p['PMID']}**: *{p['Title']}*")
         if not has_kept_papers: st.info("No literature passed filters. Systems biology used.")
+        # 3. Show the Papers that the AI threw out (The Acronym Catcher)
+    ai_discarded = st.session_state.agent_state.get("ai_filtered_evidence", [])
+    if ai_discarded:
+        with st.expander("🤖 AI Pre-Filtered Literature (Auto-Discarded)", expanded=True):
+            st.info("The AI evaluated up to 10 papers per gene. The following papers scored < 4 and were automatically excluded to prevent hallucinations and acronym collisions.")
+            for doc in ai_discarded:
+                st.markdown(f"- **{doc['Gene']}** (Score: {doc['Score']}): *{doc['Title']}* - Reason: `{doc['Reason']}`")
 
     st.markdown("---")
     st.subheader("📊 Multi-Modal Target Analytics")

@@ -51,7 +51,14 @@ def render_tme_dashboard(results_df, stats_df):
             title=f"Interactive TME Proportions by {risk_col.title()}"
         )
         
-        fig_box.update_layout(boxmode='group', height=500, template="plotly_white")
+        fig_box.update_layout(
+            boxmode='group', 
+            height=500, 
+            template="plotly_dark", # Switched for Dark Mode
+            plot_bgcolor='rgba(0,0,0,0)', # Transparent background
+            paper_bgcolor='rgba(0,0,0,0)',
+            margin=dict(t=40, b=40, l=40, r=40)
+        )
         st.plotly_chart(fig_box, use_container_width=True)
     else:
         st.warning("⚠️ No valid clinical grouping column found in metadata to render comparative plots. Ensure your metadata includes a column with 'risk', 'category', 'group', or 'cohort' in the name.")
