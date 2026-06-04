@@ -4,3 +4,9 @@
 # Ignore Python Cache
 __pycache__/
 *.pyc
+
+# Ignore vscode
+.vscode/
+
+# Ignore lib
+lib/

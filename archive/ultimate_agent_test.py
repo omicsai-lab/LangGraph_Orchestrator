@@ -29,7 +29,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import NuSVR
 import plotly.express as px
-from tme_core import TMECore
+from archive.tme_core import TMECore
 
 # --- 3. GENOMICS & BIOINFORMATICS ---
 import anndata as ad
@@ -1067,7 +1067,7 @@ with col2:
             if st.button("🧬 Run Rigorous TME Analysis", type="primary", width="stretch"):
                 with st.spinner("Deconvolving TME Axes..."):
                     try:
-                        from tme_core import TMECore
+                        from archive.tme_core import TMECore
                         engine = TMECore(counts_df_raw, metadata_df_raw)
                         results, stats = engine.run_analysis()
                         st.session_state.tme_results = results
@@ -1077,7 +1077,7 @@ with col2:
                         st.error(f"❌ TME Engine Error: {str(e)}")
 
             if st.session_state.get('tme_analysis_complete'):
-                from dashboard_components import render_tme_dashboard
+                from archive.dashboard_components import render_tme_dashboard
                 key_finding, risk_col_name = render_tme_dashboard(st.session_state.tme_results, st.session_state.tme_stats)
 
         # --- VOLCANO PLOT ---
