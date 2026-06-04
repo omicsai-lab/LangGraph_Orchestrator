@@ -721,6 +721,7 @@ def planner_node(state: AgentState):
     return {"plan": response.steps}
 
 def executor_node(state: AgentState):
+    st.write("⚙️ **[Node: Executor]** Engaging multi-omic tool execution...")
     plan_text = " ".join(state.get("plan", [])).lower()
     genes = state.get("significant_genes", [])
     new_evidence = []
@@ -738,7 +739,7 @@ def executor_node(state: AgentState):
         
         # --- 1. BIOLOGICAL CONTEXT GATE ---
         try:
-            st.markdown(f"   -> Fetching biological context for {hugo}...")
+            st.write(f"   - 🧬 **[Biological Context Gate]** Fetching baseline definition for {hugo}...")
             gene_context = get_gene_info(hugo)
         except Exception as e:
             gene_context = {"name": "Unknown", "type": "Unknown", "summary": "API Unavailable.", "aliases": ""}
@@ -747,7 +748,7 @@ def executor_node(state: AgentState):
         
         # --- 2. GTEX TISSUE GATE ---
         try:
-            st.markdown(f"      -> Profiling GTEx normal tissue distribution for {hugo}...")
+            st.write(f"   - 🔬 **[GTEx Tissue Gate]** Profiling normal tissue distribution for {hugo}...")
             tissue_profile = fetch_normal_tissue_profile(hugo)
             report["biology"]["normal_tissue_gtex"] = tissue_profile
         except Exception as e:
@@ -755,7 +756,7 @@ def executor_node(state: AgentState):
             
         # --- 3. UNIPROT STRUCTURAL GATE ---
         try:
-            st.markdown(f"      -> Hunting UniProt for Active Sites for {hugo}...")
+            st.write(f"   - 🧩 **[UniProt Structural Gate]** Auditing 3D sub-cellular localization for {hugo}...")
             uniprot_id = get_uniprot_id(hugo)
             if uniprot_id:
                 pockets = get_uniprot_binding_sites(uniprot_id)
@@ -769,7 +770,7 @@ def executor_node(state: AgentState):
             
         # --- 4. OPEN TARGETS GATE ---
         try:
-            st.markdown(f"      -> Fetching Tractability & Essentiality for {hugo}...")
+            st.write(f"   - 🎯 **[OpenTargets Gate]** Fetching Tractability & Essentiality for {hugo}...")
             report["evidence"]["OpenTargets"] = fetch_target_tractability(hugo)
         except Exception as e:
             report["evidence"]["OpenTargets"] = {"status": f"Database Connection Unavailable: {str(e)}"}
@@ -777,6 +778,7 @@ def executor_node(state: AgentState):
         # --- 5. ONCOKB GATE ---
         if "oncokb" in plan_text:
             try:
+                st.write(f"   - 💊 **[OncoKB Gate]** Cross-referencing FDA approvals for {hugo}...")
                 report["evidence"]["OncoKB"] = get_onco_data(hugo, alt, tumor_type)
             except Exception as e:
                 report["evidence"]["OncoKB"] = {"status": f"Database Connection Unavailable: {str(e)}"}
@@ -784,7 +786,7 @@ def executor_node(state: AgentState):
         # --- 6. STRING NETWORK GATE ---
         if "Discovery" in state.get("analysis_mode", "Clinical Triage"):
             try:
-                st.markdown(f"      -> Fetching STRING protein network for {hugo}...")
+                st.write(f"   - 🕸️ **[STRING Network Gate]** Constructing interaction network for {hugo}...")
                 report["evidence"]["STRING_Interactions"] = get_protein_interactions(hugo)
             except Exception as e:
                 report["evidence"]["STRING_Interactions"] = {"status": f"Database Connection Unavailable: {str(e)}"}
@@ -792,6 +794,7 @@ def executor_node(state: AgentState):
         # --- 7. PUBMED & AI TRIAGE GATE ---
         if "pubmed" in plan_text:
             try:
+                st.write(f"   - 📚 **[PubMed & AI Triage Gate]** Performing intent-driven semantic literature review for {hugo}...")
                 # EXTRACT THE NETWORK WE JUST FETCHED (safe defaults if network fetching failed)
                 interactors = report.get("evidence", {}).get("STRING_Interactions", {}).get("interacting_proteins", [])
                 
@@ -809,7 +812,7 @@ def executor_node(state: AgentState):
                 
                 # --- AI RELEVANCE SCORER (OVERSAMPLE & FILTER) ---
                 if pubmed_data.get("status") == "Success" and pubmed_data.get("papers"):
-                    st.markdown(f"   -> Grading literature relevance for {hugo}...")
+                    st.write(f"      -> 🤖 Grading literature relevance for {hugo}...")
                     grader_llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key).with_structured_output(PaperScore)
                     
                     candidate_papers = pubmed_data["papers"]
@@ -874,7 +877,7 @@ def executor_node(state: AgentState):
         # --- 8. CLINICAL TRIALS GATE ---
         if "clinicaltrials" in plan_text or "trials" in plan_text:
             try:
-                st.markdown(f"   -> Fetching Clinical Trials for {hugo}...")
+                st.write(f"   - 🏥 **[Clinical Trials Gate]** Fetching actively recruiting trials for {hugo}...")
                 report["evidence"]["ClinicalTrials"] = search_clinical_trials(hugo, tumor_type)
             except Exception as e:
                 report["evidence"]["ClinicalTrials"] = {"status": f"Database Connection Unavailable: {str(e)}"}
@@ -885,7 +888,7 @@ def executor_node(state: AgentState):
     return {"gathered_evidence": new_evidence, "ai_filtered_evidence": ai_filtered_evidence_list}
 
 def clinical_review_node(state: AgentState):
-    st.markdown("🧑‍⚕️ **[NODE: Clinical Review]** Pathologist and Oncologist are debating...")
+    st.write("🧑‍⚕️ **[Node: Clinical Review]** Cross-referencing findings with multi-agent clinical tumor board...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0.3, api_key=openai_key)
     
     prompt = f"""
@@ -901,7 +904,7 @@ def clinical_review_node(state: AgentState):
     return {"expert_consensus": response.content}
 
 def writer_node(state: AgentState):
-    st.markdown("✍️ [NODE: Writer] Synthesizing the final clinical report...")
+    st.write("✍️ **[Node: Writer]** Synthesizing evidence into clinical-grade report...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
     
     analysis_mode = state.get("analysis_mode", "Clinical Triage")
@@ -917,6 +920,7 @@ def writer_node(state: AgentState):
         4. SYSTEMS APPROACH: Discuss genes conceptually within their pathways.
         5. GUILT BY ASSOCIATION: If a target lacks direct literature or tractability, evaluate its "STRING_Interactions". Propose backdoor therapeutic strategies using its direct neighbors.
         6. TISSUE CONTEXT: If the Expert Consensus flags lineage mismatches (e.g., breast genes in melanoma, or stromal admixture), state this clearly once in the executive summary, and frame the rest of the report around resolving this spatial uncertainty.
+        7. SUB-CELLULAR LOCALIZATION & SAFETY PROFILE: For every target evaluated, you MUST actively audit the UniProt structural data for sub-cellular localization and the GTEx data for healthy tissue expression. If an immunotherapy modality like CAR-T or an antibody drug conjugate (ADC) is requested, a target CANNOT be classified as Tier 1 unless it is explicitly verified as extracellular/surface-bound and has a low healthy-tissue cross-reactivity profile.
         
         REQUIRED REPORT STRUCTURE:
         ## 📊 Executive Summary
@@ -928,9 +932,9 @@ def writer_node(state: AgentState):
         ## 🔬 Targetable Hubs & Translational Risk Tiers
         [Synthesize the literature conceptually, but you MUST categorize each evaluated gene into one of the following Translational Risk Tiers based strictly on its OpenTargets Tractability and DepMap Essentiality data:]
         
-        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: The gene is classified by OpenTargets as highly Druggable (Tractable via Small Molecule, Antibody, or PROTAC) AND/OR it is highly Essential in DepMap CRISPR screens. Ready for translational validation.
+        * **🟢 Tier 1: Actionable Hubs (Low Risk)**: The gene is classified as highly Druggable, highly Essential, AND explicitly verified via UniProt structural data as localized to the extracellular plasma membrane (essential for cell-surface modalities like CAR-T/ADCs) with clean GTEx healthy-tissue baselines. Ready for translational validation.
         * **🟡 Tier 2: Network Dependencies (Moderate Risk)**: The gene is biologically relevant but lacks direct OpenTargets druggability (e.g., intracellular and non-essential). However, its STRING interactors or pathways are actionable. Intervene at the network level.
-        * **🟠 Tier 3: Orphan Signals (High Risk)**: The gene is Not Tractable, Not Essential in DepMap, lacks literature, and has no actionable interactors. Highly speculative; requires orthogonal wet-lab validation.
+        * **🟠 Tier 3: Orphan Signals (High Risk)**: The gene is Not Tractable, Not Essential in DepMap, lacks literature, and has no actionable interactors, OR targets proposed for cell-surface therapies that UniProt data flags as strictly intracellular, nuclear, or mitochondrial (representing a structural mismatch). Highly speculative; requires orthogonal wet-lab validation.
         * **🔴 Tier 4: Probable Artifacts (Do Not Pursue)**: Pseudogenes, lineage mismatches (e.g., breast genes in melanoma), or acronym collisions.
         
         [Discuss the genes under their appropriate Tier headers.]
@@ -963,6 +967,7 @@ def writer_node(state: AgentState):
         - **Druggability:** [Summarize modality buckets, or state none]
         - **Essentiality:** [State if it is essential in DepMap screens, or state none]
         - **Structural Vulnerability:** [CRITICAL: Check the 'UniProt_Pockets' data. Explicitly state if the target has defined druggable active sites/pockets, or if it lacks them.]
+        - **Sub-cellular Localization (UniProt/GTEx):** [Explicitly state if the protein is localized on the cell surface/transmembrane vs intracellular, and note if GTEx flags any critical healthy-tissue expression liabilities.]
 
         ### 💊 OncoKB Therapeutics
         - **Standard of Care (On-Label):** [Drug Name] (PMIDs: [List])
@@ -983,7 +988,7 @@ def writer_node(state: AgentState):
         HumanMessage(content=user_context)
     ])
     
-    st.markdown("✅ **Final report successfully written.**")
+    st.write("✅ **Final report successfully written.**")
     return {"final_report": response.content}
 
 def route_start(state: AgentState):
