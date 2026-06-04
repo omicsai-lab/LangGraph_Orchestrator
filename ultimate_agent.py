@@ -704,10 +704,16 @@ def planner_node(state: AgentState):
     sys_msg = """You are an expert Clinical Bioinformatics Planner. 
     Analyze the user prompt and genes. Output a step-by-step plan to gather data.
     Available Tools: 
-    1. 'OpenTargets' (Druggability Tractability & CRISPR Essentiality) # <-- NEW
-    2. 'OncoKB' (FDA drugs)
-    3. 'PubMed' (Experimental research)
-    4. 'ClinicalTrials' (Actively recruiting trials)"""
+    1. 'Biological Context Gate' (Maps baseline disease-to-gene variants and handles initial disease context onboarding)
+    2. 'GTEx Tissue Gate' (Audits healthy tissue expression baselines to identify potential off-tumor toxicities)
+    3. 'OpenTargets Gate' (Evaluates drug tractability modalities and CRISPR cellular essentiality knockout scores)
+    4. 'OncoKB Gate' (Cross-references FDA targeted therapies, actionability tiers, and resistance profiles)
+    5. 'STRING Network Gate' (Constructs and clusters functional protein-protein interaction networks for pathway context)
+    6. 'PubMed & AI Triage Gate' (Performs intent-driven semantic literature reviews to uncover hidden molecular mechanisms)
+    7. 'UniProt Structural Gate' (Audits 3D protein structures and subcellular localization to verify cell-surface vs. intracellular expression)
+    8. 'Clinical Trials Gate' (Identifies actively recruiting human clinical trials and patient cohort criteria)
+    
+    Directive: The execution plan must be highly comprehensive, structurally robust, and clinical-grade. Ensure every gate relevant to solving the user's specific biological or therapeutic intent is actively leveraged. Do not omit necessary analytical steps; prioritize absolute thoroughness and translational utility for the clinical oncology team."""
     
     context = f"User Prompt: {state.get('user_prompt')}\nGenes: {state.get('significant_genes')}"
     response = structured_llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=context)])
@@ -957,8 +963,6 @@ def writer_node(state: AgentState):
         - **Druggability:** [Summarize modality buckets, or state none]
         - **Essentiality:** [State if it is essential in DepMap screens, or state none]
         - **Structural Vulnerability:** [CRITICAL: Check the 'UniProt_Pockets' data. Explicitly state if the target has defined druggable active sites/pockets, or if it lacks them.]
-
-        ### 💊 OncoKB Therapeutics
 
         ### 💊 OncoKB Therapeutics
         - **Standard of Care (On-Label):** [Drug Name] (PMIDs: [List])
