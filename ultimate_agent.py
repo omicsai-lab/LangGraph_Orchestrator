@@ -698,6 +698,7 @@ def design_validation_experiment(gene_symbol, cancer_type):
 # 3. LANGGRAPH NODES
 # ==========================================
 def planner_node(state: AgentState):
+    st.write("📝 **[Node: Planner]** Architecting 8-gate clinical data gathering strategy...")
     llm = ChatOpenAI(model="gpt-5.2", temperature=0, api_key=openai_key)
     structured_llm = llm.with_structured_output(Plan)
     
@@ -1142,7 +1143,7 @@ with col1:
     data_ready = not st.session_state.upregulated_df.empty
     
     if not data_ready:
-        st.info("⚠️ Please upload your data and click 'Generate Volcano Plot' first to populate actionable targets.")
+        st.info("⚠️ Please upload your data and click 'Apply Configuration & Generate Plot' first to populate actionable targets.")
         
     run_button = st.button(
         btn_text, 
@@ -1214,7 +1215,10 @@ with col2:
                 if de_engine == "PyDESeq2":
                     try:
                         # --- Updated PyDESeq2 logic with covariates and Windows Deadlock Guard (n_cpus=1) ---
-                        dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design_factors=design_factors, n_cpus=1)
+                        # Filter low-count genes (using axis=0 since PyDESeq2 expects genes as columns)
+                        counts_df = counts_df.loc[:, counts_df.sum(axis=0) >= 10]
+                        
+                        dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design=edge_formula, n_cpus=1)
                         dds.deseq2()
                         stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2], n_cpus=1)
                         stat_res.summary()
@@ -1299,7 +1303,7 @@ with col2:
         else:
             st.warning("⚠️ **No targets selected.** Adjust your statistical cutoffs and update the plot.")
     elif not counts_file or not metadata_file:
-        st.info("👈 Upload data and click 'Generate Volcano Plot' to begin.")
+        st.info("👈 Upload data and click 'Apply Configuration & Generate Plot' to begin.")
 
 # ==========================================
 # EXECUTE THE AI GRAPH
@@ -1522,21 +1526,23 @@ if run_button and counts_file and metadata_file:
         st.session_state.base_prompt = prompt_text
         
         # --- PHASE 1: GATHERING (The Executor) ---
-        with get_openai_callback() as cb:
-            if hitl_toggle:
-                # 🤖 TRUE AGENTIC INVOCATION (Phase 1 Only)
-                final_output_state = orchestrator.invoke(initial_state)
-            else:
-                # 🤖 TRUE AGENTIC INVOCATION (Freight Train Full Pipeline)
-                final_output_state = orchestrator.invoke(initial_state)
+        with st.status("🧬 Executing Precision Oncology Graph...", expanded=True) as status:
+            with get_openai_callback() as cb:
+                if hitl_toggle:
+                    # 🤖 TRUE AGENTIC INVOCATION (Phase 1 Only)
+                    final_output_state = orchestrator.invoke(initial_state)
+                else:
+                    # 🤖 TRUE AGENTIC INVOCATION (Freight Train Full Pipeline)
+                    final_output_state = orchestrator.invoke(initial_state)
+                    
+                # Securely unpack the returned final graph state back into Streamlit memory
+                st.session_state.agent_state = final_output_state
                 
-            # Securely unpack the returned final graph state back into Streamlit memory
-            st.session_state.agent_state = final_output_state
+                # Accumulate the costs
+                st.session_state.total_tokens += cb.total_tokens
+                st.session_state.total_cost += cb.total_cost
+            status.update(label="✅ Graph Execution Paused/Complete", state="complete", expanded=False)
             
-            # Accumulate the costs
-            st.session_state.total_tokens += cb.total_tokens
-            st.session_state.total_cost += cb.total_cost
-        
         st.session_state.gathering_complete = True
         st.session_state.run_complete = False # Reset in case of a re-run
         
@@ -1642,16 +1648,18 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
             current_state["is_hitl_run"] = False # <-- NEW: Un-pause for Phase 2 synthesis!
             
             # --- PHASE 2: TUMOR BOARD & WRITING ---
-            with get_openai_callback() as cb:
-                # 🤖 TRUE AGENTIC INVOCATION (Phase 2 Only)
-                final_output_state = orchestrator.invoke(current_state)
-                
-                # Unpack the state cleanly back into Streamlit memory
-                st.session_state.agent_state = final_output_state
-                
-            # Accumulate the costs
-            st.session_state.total_tokens += cb.total_tokens
-            st.session_state.total_cost += cb.total_cost
+            with st.status("🧬 Resuming Precision Oncology Graph Synthesis...", expanded=True) as status:
+                with get_openai_callback() as cb:
+                    # 🤖 TRUE AGENTIC INVOCATION (Phase 2 Only)
+                    final_output_state = orchestrator.invoke(current_state)
+                    
+                    # Unpack the state cleanly back into Streamlit memory
+                    st.session_state.agent_state = final_output_state
+                    
+                # Accumulate the costs
+                st.session_state.total_tokens += cb.total_tokens
+                st.session_state.total_cost += cb.total_cost
+                status.update(label="✅ Graph Synthesis Complete", state="complete", expanded=False)
         
         # --- NEW: VANILLA BASELINE EXECUTION (HITL) ---
         if st.session_state.get("run_baseline"):
