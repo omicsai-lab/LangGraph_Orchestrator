@@ -1214,13 +1214,35 @@ with col2:
             else:
                 if de_engine == "PyDESeq2":
                     try:
-                        # --- Updated PyDESeq2 logic with covariates and Windows Deadlock Guard (n_cpus=1) ---
-                        # Filter low-count genes (using axis=0 since PyDESeq2 expects genes as columns)
-                        counts_df = counts_df.loc[:, counts_df.sum(axis=0) >= 10]
-                        
-                        dds = DeseqDataSet(counts=counts_df, metadata=metadata_df, design=edge_formula, n_cpus=1)
+                        # --- 1. DEFENSIVE NA & TYPE CLEANING ---
+                        # Fill any missing values with 0 and explicitly force integer types (mandatory for PyDESeq2)
+                        counts_df = counts_df.fillna(0).astype(int)
+
+                        # --- 2. DYNAMIC SAMPLE-PERCENTAGE FILTERING ---
+                        # Define thresholds: A gene must have at least 10 reads in at least 20% of the total samples
+                        min_reads_per_sample = 10
+                        sample_percentage_threshold = 0.20
+
+                        # Calculate the minimum number of samples required based on current dataset size (at least 1)
+                        min_required_samples = max(1, int(len(counts_df) * sample_percentage_threshold))
+
+                        # Identify columns (genes) where the count is >= 10 in at least the minimum required samples
+                        genes_passing_filter = (counts_df >= min_reads_per_sample).sum(axis=0) >= min_required_samples
+
+                        # Filter the matrix columns to keep only the passing genes
+                        counts_df = counts_df.loc[:, genes_passing_filter]
+
+                        # --- 3. INITIALIZE MULTI-THREADED ENGINE ---
+                        # Ensure n_cpus=4 is active to parallelize across our system cores
+                        dds = DeseqDataSet(
+                            counts=counts_df,
+                            metadata=metadata_df,
+                            design=edge_formula,
+                            refit_cooks=True,
+                            n_cpus=4
+                        )
                         dds.deseq2()
-                        stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2], n_cpus=1)
+                        stat_res = DeseqStats(dds, contrast=[condition_col, level_1, level_2], n_cpus=4)
                         stat_res.summary()
                         results_df = stat_res.results_df
                     except Exception as e:
