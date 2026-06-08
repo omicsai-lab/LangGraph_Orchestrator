@@ -1548,22 +1548,24 @@ if run_button and counts_file and metadata_file:
         st.session_state.base_prompt = prompt_text
         
         # --- PHASE 1: GATHERING (The Executor) ---
-        with st.status("🧬 Executing Precision Oncology Graph...", expanded=True) as status:
-            with get_openai_callback() as cb:
-                if hitl_toggle:
-                    # 🤖 TRUE AGENTIC INVOCATION (Phase 1 Only)
-                    final_output_state = orchestrator.invoke(initial_state)
-                else:
-                    # 🤖 TRUE AGENTIC INVOCATION (Freight Train Full Pipeline)
-                    final_output_state = orchestrator.invoke(initial_state)
+        st.markdown("### 🧬 Pipeline Execution Timeline")
+        with st.container(border=True):
+            with st.spinner("Executing Precision Oncology Graph..."):
+                with get_openai_callback() as cb:
+                    if hitl_toggle:
+                        # 🤖 TRUE AGENTIC INVOCATION (Phase 1 Only)
+                        final_output_state = orchestrator.invoke(initial_state)
+                    else:
+                        # 🤖 TRUE AGENTIC INVOCATION (Freight Train Full Pipeline)
+                        final_output_state = orchestrator.invoke(initial_state)
+                        
+                    # Securely unpack the returned final graph state back into Streamlit memory
+                    st.session_state.agent_state = final_output_state
                     
-                # Securely unpack the returned final graph state back into Streamlit memory
-                st.session_state.agent_state = final_output_state
-                
-                # Accumulate the costs
-                st.session_state.total_tokens += cb.total_tokens
-                st.session_state.total_cost += cb.total_cost
-            status.update(label="✅ Graph Execution Paused/Complete", state="complete", expanded=False)
+                    # Accumulate the costs
+                    st.session_state.total_tokens += cb.total_tokens
+                    st.session_state.total_cost += cb.total_cost
+            st.success("✅ Graph Execution Paused/Complete")
             
         st.session_state.gathering_complete = True
         st.session_state.run_complete = False # Reset in case of a re-run
@@ -1571,17 +1573,19 @@ if run_button and counts_file and metadata_file:
         if not hitl_toggle:
             # --- NEW: VANILLA BASELINE EXECUTION ---
             if st.session_state.get("run_baseline"):
-                with st.status("⚖️ Generating Vanilla LLM Baseline...", expanded=True):
-                    st.markdown("Bypassing OpenTargets, OncoKB, and RAG...")
-                    vanilla_llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
-                    v_sys = "You are a clinical oncology assistant. Write a report using only your training data. Do not use tools."
-                    v_prompt = f"Task: {st.session_state.base_prompt}\nTarget Genes: {', '.join(st.session_state.ai_targets)}\nCancer: {st.session_state.base_cancer_type}"
-                    try:
-                        v_res = vanilla_llm.invoke([SystemMessage(content=v_sys), HumanMessage(content=v_prompt)])
-                        st.session_state.baseline_report = v_res.content
-                        st.markdown("✅ Vanilla Baseline complete.")
-                    except Exception as e:
-                        st.session_state.baseline_report = f"Vanilla LLM Error: {e}"
+                st.markdown("### ⚖️ Generating Vanilla LLM Baseline...")
+                with st.container(border=True):
+                    with st.spinner("Executing Baseline..."):
+                        st.markdown("Bypassing OpenTargets, OncoKB, and RAG...")
+                        vanilla_llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
+                        v_sys = "You are a clinical oncology assistant. Write a report using only your training data. Do not use tools."
+                        v_prompt = f"Task: {st.session_state.base_prompt}\nTarget Genes: {', '.join(st.session_state.ai_targets)}\nCancer: {st.session_state.base_cancer_type}"
+                        try:
+                            v_res = vanilla_llm.invoke([SystemMessage(content=v_sys), HumanMessage(content=v_prompt)])
+                            st.session_state.baseline_report = v_res.content
+                            st.success("✅ Vanilla Baseline complete.")
+                        except Exception as e:
+                            st.session_state.baseline_report = f"Vanilla LLM Error: {e}"
 
             st.session_state.run_complete = True
             # FIX: Use safe .get() unpacking to prevent KeyError if generation fails
@@ -1670,32 +1674,36 @@ if st.session_state.get("gathering_complete") and not st.session_state.get("run_
             current_state["is_hitl_run"] = False # <-- NEW: Un-pause for Phase 2 synthesis!
             
             # --- PHASE 2: TUMOR BOARD & WRITING ---
-            with st.status("🧬 Resuming Precision Oncology Graph Synthesis...", expanded=True) as status:
-                with get_openai_callback() as cb:
-                    # 🤖 TRUE AGENTIC INVOCATION (Phase 2 Only)
-                    final_output_state = orchestrator.invoke(current_state)
-                    
-                    # Unpack the state cleanly back into Streamlit memory
-                    st.session_state.agent_state = final_output_state
-                    
-                # Accumulate the costs
-                st.session_state.total_tokens += cb.total_tokens
-                st.session_state.total_cost += cb.total_cost
-                status.update(label="✅ Graph Synthesis Complete", state="complete", expanded=False)
+            st.markdown("### 🧬 Pipeline Execution Timeline")
+            with st.container(border=True):
+                with st.spinner("Resuming Precision Oncology Graph Synthesis..."):
+                    with get_openai_callback() as cb:
+                        # 🤖 TRUE AGENTIC INVOCATION (Phase 2 Only)
+                        final_output_state = orchestrator.invoke(current_state)
+                        
+                        # Unpack the state cleanly back into Streamlit memory
+                        st.session_state.agent_state = final_output_state
+                        
+                    # Accumulate the costs
+                    st.session_state.total_tokens += cb.total_tokens
+                    st.session_state.total_cost += cb.total_cost
+                st.success("✅ Graph Synthesis Complete")
         
         # --- NEW: VANILLA BASELINE EXECUTION (HITL) ---
         if st.session_state.get("run_baseline"):
-            with st.status("⚖️ Generating Vanilla LLM Baseline...", expanded=True):
-                st.markdown("Bypassing OpenTargets, OncoKB, and RAG...")
-                vanilla_llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
-                v_sys = "You are a clinical oncology assistant. Write a report using only your training data. Do not use tools."
-                v_prompt = f"Task: {st.session_state.base_prompt}\nTarget Genes: {', '.join(st.session_state.ai_targets)}\nCancer: {st.session_state.base_cancer_type}"
-                try:
-                    v_res = vanilla_llm.invoke([SystemMessage(content=v_sys), HumanMessage(content=v_prompt)])
-                    st.session_state.baseline_report = v_res.content
-                    st.markdown("✅ Vanilla Baseline complete.")
-                except Exception as e:
-                    st.session_state.baseline_report = f"Vanilla LLM Error: {e}"
+            st.markdown("### ⚖️ Generating Vanilla LLM Baseline...")
+            with st.container(border=True):
+                with st.spinner("Executing Baseline..."):
+                    st.markdown("Bypassing OpenTargets, OncoKB, and RAG...")
+                    vanilla_llm = ChatOpenAI(model="gpt-5.2", temperature=0.2, api_key=openai_key)
+                    v_sys = "You are a clinical oncology assistant. Write a report using only your training data. Do not use tools."
+                    v_prompt = f"Task: {st.session_state.base_prompt}\nTarget Genes: {', '.join(st.session_state.ai_targets)}\nCancer: {st.session_state.base_cancer_type}"
+                    try:
+                        v_res = vanilla_llm.invoke([SystemMessage(content=v_sys), HumanMessage(content=v_prompt)])
+                        st.session_state.baseline_report = v_res.content
+                        st.success("✅ Vanilla Baseline complete.")
+                    except Exception as e:
+                        st.session_state.baseline_report = f"Vanilla LLM Error: {e}"
 
         # Mark as finished and refresh the page to show the results
         st.session_state.run_complete = True
