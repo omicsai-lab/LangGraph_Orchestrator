@@ -255,3 +255,4 @@ The executor agent orchestrates calls to the following public databases and APIs
 | **Front-End** | [Streamlit](https://streamlit.io/) |
 | **Containerization** | Docker (Python 3.11-slim base) |
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20842287.svg)](https://doi.org/10.5281/zenodo.20842287)
