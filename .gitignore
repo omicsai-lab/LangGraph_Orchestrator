@@ -1,6 +1,9 @@
 # Ignore Streamlit Secrets (CRITICAL)
 .streamlit/
 
+# Ignore virtual environment (machine-specific, recreate with pip install)
+.venv/
+
 # Ignore Python Cache
 __pycache__/
 *.pyc
@@ -10,3 +13,6 @@ __pycache__/
 
 # Ignore lib
 lib/
+
+# Ignore macOS metadata
+.DS_Store
