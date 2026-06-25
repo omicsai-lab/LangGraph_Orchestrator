@@ -24,4 +24,4 @@ COPY . .
 EXPOSE 8501
 
 # Step 8: The exact command to boot up your orchestrator automatically when the container starts
-ENTRYPOINT ["streamlit", "run", "ultimate_agent.py", "--server.port=8501", "--server.address=0.0.0.0"]
+ENTRYPOINT ["streamlit", "run", "ultimate_agent.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.baseUrlPath=OmicsGPT"]
