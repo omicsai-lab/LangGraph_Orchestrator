@@ -1,3 +1,9 @@
+# OmicsGPT
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20842287.svg)](https://doi.org/10.5281/zenodo.20842287)
+
+OmicsGPT is an open-source multi-agent framework for reproducible omics data analysis powered by large language models.
+
 # 🧬 Agentic Precision Oncology Pipeline
 Powered by LangGraph, PyDESeq2, OncoKB, and PubMed.
 
@@ -256,3 +262,9 @@ The executor agent orchestrates calls to the following public databases and APIs
 | **Containerization** | Docker (Python 3.11-slim base) |
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20842287.svg)](https://doi.org/10.5281/zenodo.20842287)
+
+## Citation
+
+If you use OmicsGPT in your research, please cite the archived software release:
+
+> OmicsGPT v1.0.0. Zenodo. https://doi.org/10.5281/zenodo.20842287
