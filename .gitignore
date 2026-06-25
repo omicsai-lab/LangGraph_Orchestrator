@@ -16,3 +16,6 @@ lib/
 
 # Ignore macOS metadata
 .DS_Store
+
+.streamlit/secrets.toml
+.env
