@@ -10,3 +10,10 @@ __pycache__/
 
 # Ignore lib
 lib/
+
+# Ignore local Python virtual environment
+.venv/
+
+# Ignore local environment/credential files
+.env
+.env.*
