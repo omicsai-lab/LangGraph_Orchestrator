@@ -45,6 +45,8 @@ from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
 from stats_engine import run_differential_stats
 
+from omicsgpt.intake_panel import render_read_only_intake
+
 # ==========================================
 # PAGE CONFIGURATION & SECRETS
 # ==========================================
@@ -1031,6 +1033,9 @@ with col1:
     st.subheader("1. Session Data")
     counts_file = st.file_uploader("Upload RNA Counts (CSV)", type=["csv"])
     metadata_file = st.file_uploader("Upload Metadata (CSV)", type=["csv"])
+    
+    with st.expander("Inspect uploaded data (read-only preview)", expanded=False):
+        render_read_only_intake(counts_file, metadata_file)
     
     st.markdown("---")
     st.subheader("Optional: DNA Mutational Profile")
