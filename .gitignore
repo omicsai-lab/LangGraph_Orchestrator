@@ -17,3 +17,13 @@ lib/
 # Ignore local environment/credential files
 .env
 .env.*
+
+# R session history and workspace files
+.Rhistory
+.RData
+.Ruserdata
+
+# Python testing artifacts
+.pytest_cache/
+.coverage
+htmlcov/
