@@ -15,7 +15,7 @@ from omicsgpt.vnext_workflow import (
 
 st.set_page_config(page_title='OmicsGPT vNext', layout='wide')
 st.title('OmicsGPT vNext')
-st.caption('V2.4C — Validated bulk RNA-seq and researcher-approved PyDESeq2. No AI calls.')
+st.caption('V2.5B — Researcher-approved PyDESeq2 and exploratory results explorer. No AI calls.')
 
 st.selectbox('Data modality', ['Bulk RNA-seq raw counts'], help='Other omics modalities are not supported in V1.')
 counts_upload = st.file_uploader('Counts CSV', type='csv', key='vnext_counts')
@@ -196,6 +196,9 @@ if outcome is not None:
     table = outcome['results'].copy()
     st.success(f'PyDESeq2 completed for {len(table):,} genes.')
     st.dataframe(table.reset_index().rename(columns={'index': 'gene_id'}), width='stretch')
+    # Display-only exploration: does not change approval or rerun PyDESeq2.
+    from omicsgpt.results_panel import render_results_panel
+    render_results_panel(table, numerator=numerator, reference=reference, fingerprint=current_fp)
     st.subheader('Filtering and model diagnostics')
     st.json({'filter_audit': outcome['filter_audit'], 'diagnostics': outcome['diagnostics'],
              'model': outcome['model']})
