@@ -1,7 +1,11 @@
-"""OmicsGPT vNext: bulk RNA-seq intake only. No statistical execution."""
+"""OmicsGPT vNext: validated bulk RNA-seq intake and approved PyDESeq2."""
 import streamlit as st
 import time
 import hashlib
+import json
+from datetime import datetime, timezone
+from omicsgpt.run_state import (reconcile_state, record_approval, is_approved,
+    record_completed, current_result, clear_result)
 from omicsgpt.intake_suggestions import suggest_columns, compact_group_sizes
 
 _render_started = time.perf_counter()
@@ -11,13 +15,14 @@ from omicsgpt.vnext_workflow import (
 
 st.set_page_config(page_title='OmicsGPT vNext', layout='wide')
 st.title('OmicsGPT vNext')
-st.caption('V1 — Validated bulk RNA-seq intake. No differential expression or AI calls.')
+st.caption('V2.4C — Validated bulk RNA-seq and researcher-approved PyDESeq2. No AI calls.')
 
 st.selectbox('Data modality', ['Bulk RNA-seq raw counts'], help='Other omics modalities are not supported in V1.')
 counts_upload = st.file_uploader('Counts CSV', type='csv', key='vnext_counts')
 metadata_upload = st.file_uploader('Metadata CSV', type='csv', key='vnext_metadata')
 
 if not counts_upload or not metadata_upload:
+    reconcile_state(st.session_state, None)
     st.info('Upload both CSV files to inspect their structure and design.')
     st.stop()
 
@@ -27,6 +32,7 @@ from omicsgpt.csv_import import read_strict_csv, CSVImportError
 try:
     meta_source = read_strict_csv(metadata_upload.getvalue())
 except (CSVImportError, ValueError, UnicodeError) as exc:
+    reconcile_state(st.session_state, None)
     st.error(f'Metadata import blocked: {exc}')
     st.stop()
 
@@ -34,6 +40,7 @@ except (CSVImportError, ValueError, UnicodeError) as exc:
 try:
     count_source = read_strict_csv(counts_upload.getvalue(), use_identifier_as_index=True)
 except (CSVImportError, ValueError, UnicodeError) as exc:
+    reconcile_state(st.session_state, None)
     st.error(f'Counts import blocked: {exc}')
     st.stop()
 
@@ -52,6 +59,7 @@ sample_id_col = st.selectbox('Metadata sample ID', fields,
                              key=f'vnext_sample_{source_key}', help=suggestions.sample_id_reason)
 condition_options = [f for f in fields if f != sample_id_col]
 if not condition_options:
+    reconcile_state(st.session_state, None)
     st.error('Metadata must include a grouping variable in addition to sample IDs.')
     st.stop()
 preferred_group = suggestions.grouping_column if suggestions.grouping_column in condition_options else condition_options[0]
@@ -61,6 +69,7 @@ group_col = st.selectbox('Grouping variable', condition_options,
                          help='Researcher must verify that this represents the intended experimental groups.')
 levels = sorted(meta_source.frame[group_col].astype(str).unique().tolist())
 if len(levels) < 2:
+    reconcile_state(st.session_state, None)
     st.error('At least two grouping levels are required.')
     st.stop()
 if len(levels) > 20:
@@ -74,13 +83,24 @@ covariates = st.multiselect('Categorical covariates (optional)',
                             [f for f in condition_options if f != group_col],
                             key=f'vnext_covariates_{source_key}_{sample_id_col}_{group_col}')
 
+st.subheader('Statistical settings')
+min_count = st.number_input('Minimum counts per qualifying sample', min_value=0,
+                            max_value=1000000, value=10, step=1,
+                            help='Gene must have at least this many counts in the required fraction of samples.')
+min_fraction_percent = st.number_input('Minimum percentage of samples', min_value=1,
+                                       max_value=100, value=20, step=1,
+                                       help='Required sample count is rounded up.')
+st.caption('Engine: PyDESeq2; requested dispersion trend: parametric (automatic internal fallback recorded); Cook outlier refitting: enabled.')
+
 validation_started = time.perf_counter()
 try:
     bundle = inspect_uploads(counts_upload.getvalue(), metadata_upload.getvalue(),
                              sample_id_col=sample_id_col, group_col=group_col,
                              numerator=numerator, reference=reference,
-                             covariates=tuple(covariates))
+                             covariates=tuple(covariates), min_count=int(min_count),
+                             min_fraction=float(min_fraction_percent) / 100.0)
 except (CSVImportError, ValueError, TypeError, UnicodeError) as exc:
+    reconcile_state(st.session_state, None)
     st.error(f'Intake blocked: {exc}')
     st.stop()
 
@@ -113,7 +133,7 @@ for issue in bundle.intake.issues:
 if bundle.design is not None:
     st.write('**Experimental groups**')
     group_rows, hidden_groups = compact_group_sizes(bundle.design.group_sizes)
-    st.dataframe(group_rows, hide_index=True, use_container_width=True)
+    st.dataframe(group_rows, hide_index=True, width='stretch')
     if hidden_groups:
         st.caption(f'{hidden_groups} additional groups not displayed. Choose a grouping variable with repeated biological categories.')
     st.write(f'**Design rank:** {bundle.design.design_rank} / {bundle.design.design_columns}')
@@ -127,6 +147,7 @@ with st.expander('Development timing (server-side only)'):
     st.caption('These measurements exclude Docker startup, browser rendering, and network transfer.')
 
 if bundle.config is None:
+    reconcile_state(st.session_state, None)
     st.error('Resolve all validation blockers before confirmation.')
     st.stop()
 
@@ -134,26 +155,56 @@ st.subheader('Proposed analysis contract')
 st.write(f'**Contrast:** {numerator} versus {reference}; positive log2FC will mean higher in {numerator}.')
 st.write('**Proposed transformations:** ' + ', '.join(bundle.config['transformations']))
 st.write('**Counts:** No imputation, rounding, or filtering at intake.')
-st.write('**Statistical engine:** PyDESeq2 (future milestone; not executed in V1).')
+st.write(f'**Statistical engine:** PyDESeq2; gene filter: ≥{int(min_count)} counts in ≥{int(min_fraction_percent)}% of samples; parametric requested; Cook refitting enabled.')
 with st.expander('Source hashes and complete configuration'):
     st.json(bundle.config)
 
 current_fp = fingerprint_config(bundle.config)
-if st.session_state.get('vnext_approved_fp') != current_fp:
-    st.session_state.pop('vnext_approved_fp', None)
+reconcile_state(st.session_state, current_fp)
 
-if st.button('Confirm this exact dataset and design', type='primary'):
-    st.session_state['vnext_approved_fp'] = approve_review(bundle)
+if st.button('Confirm this exact dataset, design, and statistical settings', type='primary'):
+    record_approval(st.session_state, approve_review(bundle))
 
-if st.session_state.get('vnext_approved_fp') == current_fp:
+if is_approved(st.session_state, current_fp):
+    st.success('Researcher approval matches the current scientific configuration.')
     try:
         prepared = prepare_approved_counts(bundle, current_fp, bundle.config)
-    except PermissionError as exc:
-        st.error(str(exc))
-    else:
-        st.success('Approved configuration verified. No analysis has been run.')
-        st.write(f'Prepared matrix: {prepared.shape[0]:,} samples × {prepared.shape[1]:,} genes')
+    except (PermissionError, ValueError) as exc:
+        reconcile_state(st.session_state, None)
+        st.error(f'Approved data preparation failed: {exc}')
+        st.stop()
+    st.write(f'Prepared matrix: {prepared.shape[0]:,} samples × {prepared.shape[1]:,} genes')
+    with st.expander('Prepared matrix preview'):
         st.dataframe(prepared.iloc[:5, :6])
-        st.info('PyDESeq2 execution is intentionally unavailable in V1.')
+    if st.button('Run approved PyDESeq2 analysis', type='primary'):
+        clear_result(st.session_state)
+        try:
+            # Lazy import: intake does not initialize the statistical stack.
+            from omicsgpt.guarded_execution import execute_approved_analysis
+            with st.spinner('Fitting PyDESeq2 to the approved data...'):
+                outcome = execute_approved_analysis(bundle, current_fp, bundle.config, n_cpus=1)
+            record_completed(st.session_state, current_fp, outcome)
+        except Exception as exc:
+            clear_result(st.session_state)
+            st.error(f'Analysis failed; no results were saved: {type(exc).__name__}: {exc}')
 else:
-    st.info('Review and confirm the exact configuration to preview prepared data.')
+    st.info('Review and confirm this configuration before running statistical analysis.')
+
+outcome = current_result(st.session_state, current_fp)
+if outcome is not None:
+    st.subheader('Completed differential expression')
+    table = outcome['results'].copy()
+    st.success(f'PyDESeq2 completed for {len(table):,} genes.')
+    st.dataframe(table.reset_index().rename(columns={'index': 'gene_id'}), width='stretch')
+    st.subheader('Filtering and model diagnostics')
+    st.json({'filter_audit': outcome['filter_audit'], 'diagnostics': outcome['diagnostics'],
+             'model': outcome['model']})
+    st.download_button('Download differential expression CSV',
+                       data=table.to_csv(index_label='gene_id').encode('utf-8'),
+                       file_name='omicsgpt_differential_expression.csv', mime='text/csv')
+    manifest = {'scientific_configuration': bundle.config, 'configuration_fingerprint': current_fp,
+                'filter_audit': outcome['filter_audit'], 'diagnostics': outcome['diagnostics'],
+                'model': outcome['model'], 'results_rows': len(table)}
+    st.download_button('Download analysis manifest JSON',
+                       data=json.dumps(manifest, indent=2, default=str).encode('utf-8'),
+                       file_name='omicsgpt_run_manifest.json', mime='application/json')
