@@ -52,6 +52,7 @@ def main():
         'samples': len(counts), 'genes_input': counts.shape[1],
         'filter_audit': result['filter_audit'],
         'model': result['model'],
+        'diagnostics': result['diagnostics'],
         'results_rows': len(table),
         'nonmissing_log2fc': int(table['log2FoldChange'].notna().sum()),
         'nonmissing_pvalue': int(table['pvalue'].notna().sum()),

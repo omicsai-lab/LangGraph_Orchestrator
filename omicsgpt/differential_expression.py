@@ -5,6 +5,7 @@ from time import perf_counter
 import math
 import numpy as np
 import pandas as pd
+from .model_diagnostics import extract_model_diagnostics
 
 
 class DifferentialExpressionError(RuntimeError):
@@ -70,9 +71,10 @@ def run_pydeseq2(counts: pd.DataFrame, metadata: pd.DataFrame, *, group_col: str
         stats = DeseqStats(dds, contrast=[group_col, numerator, reference], n_cpus=n_cpus)
         stats.summary()
         results = stats.results_df.copy(deep=True)
+        diagnostics = extract_model_diagnostics(dds)
     except Exception as exc:
         raise DifferentialExpressionError(f'PyDESeq2 failed; no alternative engine was run: {exc}') from exc
-    return {'results': results, 'filter_audit': audit,
+    return {'results': results, 'filter_audit': audit, 'diagnostics': diagnostics,
             'model': {'engine': 'PyDESeq2', 'version': version('pydeseq2'),
                       'design': design, 'numerator': numerator, 'reference': reference,
                       'n_cpus': n_cpus, 'elapsed_seconds': perf_counter() - start}}
