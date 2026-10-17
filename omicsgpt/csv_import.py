@@ -40,7 +40,11 @@ def read_strict_csv(source: str | Path | bytes, *, identifier_column: str | None
     if len(records) < 2 or not records[0]:
         raise CSVImportError('CSV must contain a header and at least one data row.')
     header = records[0]
-    if any(not x.strip() for x in header):
+    # A blank first header is a common exported DataFrame index convention.
+    # Accept it ONLY when the caller explicitly requests index interpretation.
+    blank_positions = [i for i, value in enumerate(header) if not value.strip()]
+    if blank_positions and not (blank_positions == [0] and use_identifier_as_index
+                                and identifier_column is None and header[0] == ''):
         raise CSVImportError('Blank CSV column header detected.')
     if len(set(header)) != len(header):
         raise CSVImportError('Duplicate CSV column headers detected before pandas import.')
