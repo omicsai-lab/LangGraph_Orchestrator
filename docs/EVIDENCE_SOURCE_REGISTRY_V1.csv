@@ -1,0 +1,13 @@
+source,role,proposed_stage,access_mode,priority,quality_or_dependency_caution,implementation_status
+Reactome,Curated pathways,V2.6,Versioned local gene sets and optional API,Primary,Pathway overlap and annotation release matter,Planned
+HGNC,Human gene nomenclature,V2.6A,Versioned local mapping or API,Primary,Historical aliases may be ambiguous,Planned
+Ensembl,Gene identifier crosswalk,V2.6A,Versioned mapping or API,Primary,Transcript and gene versions require explicit mapping,Planned
+GO Biological Process,Functional gene sets,V2.6 expansion,Versioned local gene sets,Secondary,Hierarchical terms strongly overlap,Registry only
+MSigDB Hallmark,Curated compact gene sets,V2.6 expansion,Licensed local collection,Secondary,Check license and source overlap,Registry only
+Europe PMC,Literature retrieval,V2.7,Bounded API,Primary,Publication and mention counts are not evidence strength,Registry only
+PubMed,Primary literature indexing,V2.7,Bounded API,Primary,Overlaps Europe PMC records,Registry only
+STRING,Protein functional associations,V2.7+,Bounded API or local release,Secondary,Text mining and predicted links are not independent validation,Registry only
+Human Protein Atlas,Tissue and protein context,V2.7,API or licensed download,Secondary,Assay-specific uncertainty and reuse restrictions,Registry only
+GTEx,Normal tissue expression,V2.7,Approved local summary or API,Secondary,Population and tissue context limit generalization,Registry only
+UniProt,Protein annotations,V2.7,Versioned API or download,Secondary,Annotation evidence levels vary,Registry only
+Open Targets,Disease-target evidence,V2.7+,Bounded API,Secondary,Aggregates overlapping primary sources,Registry only
