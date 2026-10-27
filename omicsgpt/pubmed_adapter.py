@@ -87,6 +87,7 @@ def _parse_xml(raw: bytes, requested: set[str]) -> dict[str, dict]:
 def search_pubmed(
     gene: str, disease: str, *, policy: PubMedPolicy = PubMedPolicy(),
     session: requests.Session | None = None, clock: Callable[[], str] = _now,
+    focus_terms: tuple[str, ...] = (),
 ) -> tuple[list[EvidenceRecord], dict]:
     """Search a literal gene+disease pair; return records and full query audit.
 
@@ -101,11 +102,21 @@ def search_pubmed(
     # Quotes and escaping prevent user text from being interpreted as arbitrary Entrez syntax.
     def literal(s: str) -> str:
         return '"' + s.replace('"', ' ') + '"[Title/Abstract]'
+    if not isinstance(focus_terms, tuple) or len(focus_terms) > 5 or any(
+        not isinstance(term, str) or not term.strip() or term != term.strip()
+        or len(term) > 80 or any(c in term for c in '\r\n') for term in focus_terms
+    ):
+        raise ValueError('focus_terms must contain at most five nonblank, trimmed short strings')
+    if len(set(focus_terms)) != len(focus_terms):
+        raise ValueError('Duplicate focus terms')
     query = f'({literal(gene)}) AND ({literal(disease)})'
+    if focus_terms:
+        query += ' AND (' + ' OR '.join(literal(term) for term in focus_terms) + ')'
+
     timestamp = clock()
     client = session or requests.Session()
     audit = {'source': 'NCBI PubMed E-Utilities', 'mode': policy.mode, 'query': query,
-             'max_records': policy.limit, 'retrieved_at_utc': timestamp, 'pmids_returned': [],
+             'max_records': policy.limit, 'focus_terms': list(focus_terms), 'retrieved_at_utc': timestamp, 'pmids_returned': [],
              'returned_count': 0, 'truncated_by_limit': None,
              'note': 'Retrieval only; no relevance or evidence-quality determination.'}
 
